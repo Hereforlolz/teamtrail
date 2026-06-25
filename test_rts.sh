@@ -52,3 +52,14 @@ curl -s -X POST https://slack.com/api/assistant.search.context \
     "include_context_messages": true,
     "limit": 5
   }' | python3 -m json.tool
+
+echo ""
+echo "── Test 4: file search (new — confirms file-result schema before trusting it in the bot) ──"
+curl -s -X POST https://slack.com/api/assistant.search.context \
+  -H "Authorization: Bearer $SLACK_USER_TOKEN" \
+  -H "Content-Type: application/json; charset=utf-8" \
+  -d '{
+    "query": "architecture OR PRD OR roadmap OR doc",
+    "content_types": ["files"],
+    "limit": 5
+  }' | python3 -m json.tool
