@@ -15,16 +15,19 @@ User opens TeamTrail from the top bar / split pane
 Assistant thread starts → role buttons + suggested prompts shown
        │
        ▼
-User picks a role (button click or typed prompt)  →  RTS searches workspace messages + users + channels
+User picks a role (button click or typed prompt)
+       │
+       ├──→  RTS searches workspace messages, files, users, channels
+       └──→  Notion MCP searches connected pages, fetches top page content
        │
        ▼
-Groq (LLaMA 3.3 70B) generates personalised briefing, grounded in real results
+Groq (LLaMA 3.3 70B) generates personalised briefing, grounded in combined results
        │
        ▼
-Briefing posted in-thread with cited source permalinks + Refresh button
+Briefing posted in-thread with cited source permalinks (Slack + Notion) + Refresh button
        │
        ▼
-Follow-up question typed in the pane  →  RTS search  →  Groq answer with citations  →  context updated
+Follow-up question typed in the pane  →  same combined search  →  Groq answer with citations  →  context updated
 ```
 
 ---
@@ -42,6 +45,8 @@ Follow-up question typed in the pane  →  RTS search  →  Groq answer with cit
 - **Follow-up questions in-thread** — just type in the assistant pane; same RTS + Groq pipeline that used to live behind `/ask`, with session context carried over
 - **Refresh briefing** button — clears state and restarts the onboarding flow
 - **Graceful sparse-workspace handling** — if RTS returns no users or channels (expected in sandboxes with limited history), the LLM is prompted to say so honestly rather than hallucinate people or channel names
+- **File search** — RTS also searches `files`, not just `messages`, surfacing PRDs and architecture docs shared in Slack
+- **Notion MCP integration** — optionally pulls relevant Notion pages into the same briefing/answer pipeline via a locally-run Notion MCP server, merged into one prompt alongside Slack messages and files
 
 ---
 
@@ -73,8 +78,8 @@ flowchart TD
         BTN[Role selection buttons\nEngineer / PM / Designer / Other]
         PROMPTS[Suggested prompts\nI'm a new Engineer / PM / Designer\nWhat channels should I join?]
         REFRESH[Refresh briefing button]
-        OUT1[Briefing message\nwith permalink citations]
-        OUT2[Follow-up answer\nwith permalink citations]
+        OUT1[Briefing message\nwith permalink citations\nSlack + Notion]
+        OUT2[Follow-up answer\nwith permalink citations\nSlack + Notion]
     end
 
     subgraph Bot["index.js — Slack Bolt App (Socket Mode)"]
@@ -82,20 +87,26 @@ flowchart TD
         DETECT[detectRoleFromText\nrouter: role pick vs follow-up question]
         ACT[Role action handler\nrole_engineer / role_pm\nrole_designer / role_other]
         SQ[asSemanticQuery\nquery rewriter]
-        FMT[formatMessageResults\nbuild prompt text + sources]
-        FMTS[formatSourcesBlock\nbuild permalink blocks]
+        FMT[formatCombinedResults\nmerge Slack messages + files\ninto prompt text + sources]
+        FMTN[notionSearch\nmerge Notion page content\ninto same prompt + sources]
+        FMTS[formatSourcesBlock\nbuild permalink blocks\nreserves slots for Notion]
         CTX[(In-memory\ncontext store\nrole · topicsCovered\nquestionsAsked · briefingSent)]
     end
 
     subgraph RTS["Slack RTS API\nassistant.search.context\nxoxp- user token"]
-        RTS1[Message search\ncontent_types: messages\ninclude_context_messages: true]
+        RTS1[Message + file search\ncontent_types: messages, files\ninclude_context_messages: true]
         RTS2[User + channel discovery\ncontent_types: users, channels]
-        RTS3[Follow-up semantic search\ncontent_types: messages\ninclude_context_messages: true]
+        RTS3[Follow-up semantic search\ncontent_types: messages, files\ninclude_context_messages: true]
+    end
+
+    subgraph Notion["Notion MCP server (local, notion.js)\nnpx @notionhq/notion-mcp-server"]
+        NSEARCH[API-post-search\nplain-text query → matching pages]
+        NPAGE[API-retrieve-page-markdown\nfetch content for top result]
     end
 
     subgraph Groq["Groq API\nLLaMA 3.3 70B Versatile"]
-        G1[Briefing prompt\nrole + messages + real people\n+ real channels]
-        G2[Follow-up prompt\nquestion + messages\n+ session context]
+        G1[Briefing prompt\nrole + Slack + Notion content\n+ real people + real channels]
+        G2[Follow-up prompt\nquestion + Slack + Notion content\n+ session context]
     end
 
     subgraph RoleExpansion["Role → Search Term Expansion"]
@@ -112,18 +123,24 @@ flowchart TD
     ACT --> RE
     RE -->|expanded OR query| RTS1
     RE -->|expanded OR query| RTS2
-    RTS1 -->|messages + context threads| FMT
+    RE -->|plain-text query| NSEARCH
+    RTS1 -->|messages + files + context| FMT
     RTS2 -->|real users + channels| G1
-    FMT -->|promptText| G1
-    FMT -->|sources array| FMTS
+    NSEARCH -->|matching page IDs| NPAGE
+    NPAGE -->|page content| FMTN
+    FMT -->|promptText + sources| FMTN
+    FMTN -->|merged promptText| G1
+    FMTN -->|merged sources| FMTS
     G1 -->|briefing text| OUT1
     FMTS -->|permalink blocks| OUT1
     ACT -->|update context| CTX
 
     DETECT -->|no role match: follow-up| SQ
     SQ -->|semantic question| RTS3
-    RTS3 -->|messages + context threads| FMT
-    FMT -->|promptText| G2
+    SQ -->|raw question text| NSEARCH
+    RTS3 -->|messages + files + context| FMT
+    FMT -->|promptText + sources| G2
+    FMTN -->|merged promptText| G2
     CTX -->|role · topicsCovered\nquestionsAsked| G2
     G2 -->|answer with N citations| OUT2
     FMTS -->|permalink blocks| OUT2
@@ -139,14 +156,14 @@ flowchart TD
 
 The bot makes three distinct uses of `assistant.search.context`:
 
-**1. Role-aware message search**
-On role selection, the bot expands the role into an OR-query (e.g. `engineering OR backend OR infrastructure OR deployment OR architecture` for Engineer) and searches `messages` with `include_context_messages: true`. This gives the LLM conversation threads, not just isolated messages.
+**1. Role-aware message and file search**
+On role selection, the bot expands the role into an OR-query (e.g. `engineering OR backend OR infrastructure OR deployment OR architecture` for Engineer) and searches `messages` and `files` with `include_context_messages: true`. This gives the LLM conversation threads and shared documents, not just isolated messages.
 
 **2. User and channel discovery**
 A second parallel call searches `users` and `channels` with the same role-expanded query, surfacing real people and channels to name-check in the briefing. Note: in sparse sandboxes (few members, little channel history), this legitimately returns empty — the prompt handles this gracefully.
 
 **3. Semantic follow-up search**
-Typed follow-up questions are rewritten into natural-language questions before being passed to RTS, nudging the API toward semantic retrieval. Question-phrased and OR-style queries are passed through unchanged.
+Typed follow-up questions are rewritten into natural-language questions before being passed to RTS, nudging the API toward semantic retrieval. Question-phrased and OR-style queries are passed through unchanged. This search also includes `files`.
 
 **User token rationale:** RTS calls use the `xoxp-` user token. Bot-token RTS calls require an `action_token`, which is only available from button/shortcut events — a typed follow-up question in the assistant pane has no such token. The user token is the correct approach, not a workaround.
 
@@ -156,7 +173,22 @@ Typed follow-up questions are rewritten into natural-language questions before b
 Test 1 (message search):   ✅  5 messages returned across #all-ai-playground, #design, #engineering
 Test 2 (user/channel):     ⚠️  Empty — expected in sparse sandbox (RTS known behaviour)
 Test 3 (semantic + ctx):   ✅  5 messages with full before/after context threads
+Test 4 (file search):      ✅  files content type returns results — see test_rts.sh
 ```
+
+---
+
+## Notion MCP — what's actually happening
+
+`notion.js` connects to a locally-run Notion MCP server as an MCP client, and makes two calls per search:
+
+**1. Search** — `API-post-search` with a plain-text query (role-based terms for briefings, the user's raw question for follow-ups). The response is Notion's raw API search JSON, returned inside the MCP `content[0].text` field as a **string** — `notion.js` parses it rather than treating it as prose. Each result is page metadata only: title and URL, no body content.
+
+**2. Page content** — for the top search result, `notion.js` calls `API-retrieve-page-markdown` with that page's ID to actually pull content, since search alone returns nothing for the LLM to summarize. This is truncated to ~1500 characters per page to keep prompts manageable.
+
+Both tool names and the JSON-string response shape were confirmed against a real server run via `test_notion_mcp.js` — they are not guessed. If a future server version changes either, re-run that script to check before assuming `notion.js` still matches.
+
+Notion sources are merged into the same `sources` array as Slack messages/files, and `formatSourcesBlock` reserves at least one slot for Notion citations specifically — a naive `slice(0, 5)` on the combined array let Slack's typically-5+ message results crowd out Notion entries even when Notion content made it into the briefing text.
 
 ---
 
@@ -164,7 +196,9 @@ Test 3 (semantic + ctx):   ✅  5 messages with full before/after context thread
 
 ```
 ├── index.js            # Main bot — Assistant lifecycle, RTS calls, Groq prompts
+├── notion.js           # Notion MCP client — connects to a locally-run Notion MCP server
 ├── test_rts.sh         # Standalone RTS smoke tester (run before deploying)
+├── test_notion_mcp.js  # Standalone Notion MCP smoke tester — confirms real tool names/shapes
 ├── .env                # Secrets (not committed)
 ├── package.json
 └── README.md
@@ -256,7 +290,25 @@ chmod +x test_rts.sh
 
 This runs three RTS calls directly against your workspace and pretty-prints the JSON. Confirm Test 1 and Test 3 return messages before proceeding. Test 2 returning empty in a new workspace is normal.
 
-### 8. Start the bot
+### 8. Notion MCP (optional but recommended)
+
+TeamTrail can pull context from Notion alongside Slack, via a **locally-run** Notion MCP server — not Notion's hosted/remote MCP, which requires interactive OAuth and doesn't fit a headless bot process.
+
+1. Go to [notion.so/profile/integrations](https://www.notion.so/profile/integrations) → create a new internal integration → copy the token (`ntn_...`)
+2. In Notion, open each page/database you want searchable → **•••** menu → **Connections** → add your integration. Pages not explicitly connected are not searchable, even with a valid token.
+3. In a separate terminal, run the server with that token. By default the server generates its own random bearer token to protect the local HTTP endpoint (separate from `NOTION_TOKEN`, which is what the server uses to talk to Notion's API) — since this runs on loopback only for local development, disable that extra auth layer rather than juggling a second token:
+   ```bash
+   NOTION_TOKEN=ntn_your_token_here npx @notionhq/notion-mcp-server --transport http --port 3331 --unsafe-disable-auth
+   ```
+4. Verify the connection and discover the real tool names before trusting it in the bot:
+   ```bash
+   node test_notion_mcp.js
+   ```
+   This prints the server's real `tools/list` response. Confirmed against a live server: the search tool is named **`API-post-search`**, and its result is Notion's raw API response as a JSON **string** inside `content[0].text` (not plain prose) — `notion.js` already parses it this way. If a server update changes either, re-run this script before trusting `notion.js` again.
+
+If the Notion MCP server isn't running, the bot still works — `notionSearch()` fails closed and briefings/answers just use Slack data, same as before this feature existed.
+
+### 9. Start the bot
 
 ```bash
 node index.js
@@ -288,6 +340,8 @@ You should see:
 | `SLACK_SIGNING_SECRET` | Request verification |
 | `SLACK_APP_TOKEN` | `xapp-` token — Socket Mode connection |
 | `GROQ_API_KEY` | Groq API key for LLaMA 3.3 inference |
+| `NOTION_TOKEN` | Internal integration token (`ntn_...`) — set in the terminal running the Notion MCP server, not the bot's own `.env`, since the server reads it directly |
+| `NOTION_MCP_URL` | Optional — defaults to `http://127.0.0.1:3331/mcp`. Override if running the Notion MCP server on a different port |
 
 ---
 
@@ -296,10 +350,13 @@ You should see:
 - **State is in-memory** — context resets on process restart. A Redis or SQLite layer would make it persistent across deployments. Per Slack's guidance for Agents & AI Apps, only metadata (role, topics, question text) is stored — never raw Slack message content.
 - **User/channel discovery** returns empty in sparse workspaces — this is an RTS API behaviour, not a bug. The LLM prompt handles it honestly.
 - **Single workspace** — the user token is workspace-scoped. Multi-workspace support would require per-installation token storage.
-- **No file search** — `assistant.search.context` supports `files` as a content type but the bot currently searches `messages`, `users`, and `channels` only.
-- **No MCP server integration yet** — Slack's Agents & AI Apps settings expose an optional Slack MCP Server toggle (search/post/read via MCP tools instead of direct RTS calls). Not enabled in this build.
+- **Notion MCP uses the local server, not the hosted one** — Notion's remote MCP requires interactive OAuth per session, which doesn't work for a headless bot. The local server with a static integration token is the only option that fits this architecture.
+- **Notion MCP requires `--unsafe-disable-auth` for this setup** — the server's own auto-generated bearer token (separate from `NOTION_TOKEN`) rotates every restart and isn't read by `notion.js`. Disabling it is safe here since the server only listens on `127.0.0.1`, but would need real handling before any deployment beyond local development.
+- **Notion page content is fetched for only the top search result** per query (`fetchContentForTop = 1` in `notion.js`), to keep prompt size and latency reasonable. Other matching pages are cited by title/URL only, without their content summarized.
+- **Slack's own MCP Server toggle is unused** — Agents & AI Apps settings expose an optional Slack MCP Server (search/post/read via MCP tools instead of direct RTS calls). This build keeps the existing direct RTS calls instead of re-platforming onto it, since it would replace already-working code with an equivalent capability rather than add a new one.
 
 ## Known gotchas (Bolt for JS, `@slack/bolt@4.7.3`)
 
 - **`app.use(assistant)` is wrong** — it pushes the raw `Assistant` instance into Bolt's middleware array without converting it, which crashes every incoming event with `middleware[toCallMiddlewareIndex] is not a function`. The correct call is **`app.assistant(assistant)`**, which internally calls `assistant.getMiddleware()` first.
 - **`say()` inside `app.action()` doesn't reliably target the active assistant thread** for block actions fired from inside the split pane — messages can end up posted to the App Home History tab instead of the live Chat pane. Posting explicitly via `client.chat.postMessage` with `body.channel.id` and `body.container.thread_ts` keeps the reply anchored to the right thread.
+- **Naive `sources.slice(0, 5)` silently dropped Notion citations** — Slack's message search alone often returns 5+ results, so Notion sources appended at the end of the merged array never survived the cutoff, even when Notion content was clearly used in the briefing text. `formatSourcesBlock` now reserves dedicated slots for Notion sources instead of truncating by array order.
