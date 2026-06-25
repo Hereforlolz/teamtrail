@@ -6,6 +6,22 @@ Built for the **Slack Agent Builder Challenge 2026**.
 
 ---
 
+## For judges and reviewers — quick start
+
+You already have access to the Slack sandbox. Fastest way to see TeamTrail working:
+
+1. Open the workspace, click the **TeamTrail icon in the top bar** (next to search) to open the split pane
+2. Click a role button, or one of the suggested prompts (e.g. "I'm a new Engineer")
+3. A briefing posts within a few seconds, grounded in real messages from `#engineering`, `#product`, `#design`, `#all-ai-playground`, and `#test-onboarding` — every claim is cited, with clickable permalinks at the bottom
+4. Type any follow-up question directly in the pane — it remembers what's already been covered
+5. Click **🔄 Refresh my briefing** to see the flow again from the top
+
+**About Notion citations:** some briefings include Notion page citations (e.g. "Architecture doc," "Team Directory") alongside Slack sources — this is the Model Context Protocol integration described below. The Notion MCP server runs locally on the development machine, not in this hosted sandbox, so if you don't see Notion citations in every briefing, that's expected, not a bug — the bot is designed to fail closed and use Slack data alone when Notion isn't reachable. See [Notion MCP — what's actually happening](#notion-mcp-whats-actually-happening) below for how that integration works when it is running.
+
+Full setup instructions, architecture, and technical writeups are below for anyone who wants the complete picture.
+
+---
+
 ## How it works
 
 ```
