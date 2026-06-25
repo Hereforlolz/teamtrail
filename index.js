@@ -160,6 +160,45 @@ function formatMessageResults(messages = []) {
   return { promptText: blocks.join('\n---\n'), sources };
 }
 
+// Formats file results from RTS (content_types: ['files']) into the same
+// shape as formatMessageResults so they can merge into one prompt + one
+// sources list. Field names are defensive (title/name, preview/snippet)
+// since RTS's exact file-result schema wasn't confirmed against this
+// workspace — empty fields degrade to 'Untitled' rather than throwing.
+function formatFileResults(files = [], startIndex = 0) {
+  if (!files.length) return { promptText: '', sources: [] };
+
+  const sources = [];
+  const blocks = files.map((f, i) => {
+    const name = f.title || f.name || 'Untitled file';
+    sources.push({ channel: f.channel_name || 'file', permalink: f.permalink });
+
+    let entry = `[${startIndex + i + 1}] 📄 File "${name}"${f.filetype ? ` (${f.filetype})` : ''}`;
+    if (f.channel_name) entry += ` — shared in #${f.channel_name}`;
+    const snippet = f.preview || f.snippet || f.plain_text;
+    if (snippet) entry += `\n    ${snippet}`;
+    return entry;
+  });
+
+  return { promptText: blocks.join('\n---\n'), sources };
+}
+
+// Merges message + file results into one prompt block and one combined
+// sources list, with file citation numbers continuing on from messages
+// instead of restarting at [1].
+function formatCombinedResults(messages = [], files = []) {
+  const msgResult = formatMessageResults(messages);
+  const fileResult = formatFileResults(files, messages.length);
+
+  const promptParts = [msgResult.promptText];
+  if (fileResult.promptText) promptParts.push(fileResult.promptText);
+
+  return {
+    promptText: promptParts.join('\n---\n'),
+    sources: [...msgResult.sources, ...fileResult.sources],
+  };
+}
+
 function formatSourcesBlock(sources) {
   if (!sources.length) return null;
   const lines = sources
