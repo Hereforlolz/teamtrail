@@ -110,19 +110,17 @@ async function notionSearchInner(query, limit, fetchContentForTop) {
     const sources = [];
     const blocks = await Promise.all(
       pages.map(async (page, i) => {
-        const title =
-          page.properties?.title?.title?.[0]?.plain_text ||
-          page.properties?.Name?.title?.[0]?.plain_text ||
-          'Untitled page';
+        const title = extractPageTitle(page);
         const url = page.url || '';
-        sources.push({ channel: 'notion', permalink: url });
+        const label = `N${i + 1}`;
+        sources.push({ channel: 'notion', permalink: url, label });
 
         let body = '';
         if (i < fetchContentForTop && page.id) {
           body = await fetchPageMarkdown(client, page.id);
         }
 
-        let entry = `[N${i + 1}] Notion page: "${title}"${url ? ` (${url})` : ''}`;
+        let entry = `[${label}] Notion page: "${title}"${url ? ` (${url})` : ''}`;
         if (body) entry += `\n${body}`;
         return entry;
       })
@@ -133,6 +131,18 @@ async function notionSearchInner(query, limit, fetchContentForTop) {
     console.error('Notion MCP search failed:', err.message);
     return { promptText: '', sources: [] };
   }
+}
+
+// Notion requires exactly one title-type property per page/database, but
+// its key name is workspace-defined — commonly "title" or "Name", but not
+// guaranteed to be either. Scanning for type === 'title' finds it
+// regardless of what it's actually called, instead of guessing two
+// hardcoded key names and silently mislabeling anything else as
+// "Untitled page".
+function extractPageTitle(page) {
+  const properties = page.properties || {};
+  const titleProp = Object.values(properties).find((p) => p?.type === 'title');
+  return titleProp?.title?.[0]?.plain_text || 'Untitled page';
 }
 
 // Fetches a page's content as markdown. Truncated to keep prompts from

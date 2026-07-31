@@ -27,6 +27,7 @@ function getContext(userId) {
       topicsCovered: [],
       questionsAsked: [],
       briefingSent: false,
+      welcomed: false,
     };
   }
   return contextStore[userId];
@@ -143,25 +144,33 @@ async function rtsSearch({ query, contentTypes = ['messages'], limit = 10, inclu
 // Formats message results into prompt-ready text AND keeps permalinks
 // separately so we can cite sources back to the user — Slack's own
 // guidelines call out sourcing/citations as expected behavior for
-// RTS-backed apps.
+// RTS-backed apps. Field access is defensive (fallbacks for missing
+// channel_name/author_name/content) the same way formatFileResults
+// already is — a message with only Block Kit content and no plain text,
+// or a deleted-user author, would otherwise inject literal "undefined"
+// strings straight into the Groq prompt.
 function formatMessageResults(messages = []) {
   if (!messages.length) return { promptText: 'No relevant messages found.', sources: [] };
 
   const sources = [];
   const blocks = messages.map((m, i) => {
-    sources.push({ channel: m.channel_name, permalink: m.permalink });
+    const channelName = m.channel_name || 'unknown-channel';
+    const authorName = m.author_name || 'Unknown';
+    const content = m.content || '(no text)';
+    const label = String(i + 1);
+    sources.push({ channel: channelName, permalink: m.permalink, label });
 
-    let entry = `[${i + 1}] #${m.channel_name} — ${m.author_name}: ${m.content}`;
+    let entry = `[${label}] #${channelName} — ${authorName}: ${content}`;
 
     if (m.context_messages?.before?.length) {
       const before = m.context_messages.before
-        .map((c) => `    (before) ${c.author_name}: ${c.text}`)
+        .map((c) => `    (before) ${c.author_name || 'Unknown'}: ${c.text || ''}`)
         .join('\n');
       entry += `\n${before}`;
     }
     if (m.context_messages?.after?.length) {
       const after = m.context_messages.after
-        .map((c) => `    (after) ${c.author_name}: ${c.text}`)
+        .map((c) => `    (after) ${c.author_name || 'Unknown'}: ${c.text || ''}`)
         .join('\n');
       entry += `\n${after}`;
     }
@@ -182,9 +191,10 @@ function formatFileResults(files = [], startIndex = 0) {
   const sources = [];
   const blocks = files.map((f, i) => {
     const name = f.title || f.name || 'Untitled file';
-    sources.push({ channel: f.channel_name || 'file', permalink: f.permalink });
+    const label = String(startIndex + i + 1);
+    sources.push({ channel: f.channel_name || 'file', permalink: f.permalink, label });
 
-    let entry = `[${startIndex + i + 1}] 📄 File "${name}"${f.filetype ? ` (${f.filetype})` : ''}`;
+    let entry = `[${label}] 📄 File "${name}"${f.filetype ? ` (${f.filetype})` : ''}`;
     if (f.channel_name) entry += ` — shared in #${f.channel_name}`;
     const snippet = f.preview || f.snippet || f.plain_text;
     if (snippet) entry += `\n    ${snippet}`;
@@ -226,11 +236,16 @@ function formatSourcesBlock(sources) {
 
   const selected = [...otherSources.slice(0, otherSlots), ...notionSources.slice(0, notionSlots)];
 
+  // Render each source's own citation label (the same [1]/[N1] marker the
+  // prompt told Groq to use inline), not a freshly computed position — a
+  // recomputed 1-based index here would drift from the LLM's inline
+  // citations the moment sources get filtered/reordered/truncated above.
   const lines = selected
-    .map((s, i) => {
-      const label = s.channel === 'notion' ? '📘 Notion' : s.channel === 'file' ? '📄 file' : `#${s.channel}`;
-      if (!s.permalink) return `${i + 1}. ${label}`;
-      return `${i + 1}. <${s.permalink}|${label}>`;
+    .map((s) => {
+      const displayLabel = s.channel === 'notion' ? '📘 Notion' : s.channel === 'file' ? '📄 file' : `#${s.channel}`;
+      const marker = s.label ? `[${s.label}]` : '•';
+      if (!s.permalink) return `${marker} ${displayLabel}`;
+      return `${marker} <${s.permalink}|${displayLabel}>`;
     })
     .join('\n');
   return {
@@ -292,7 +307,16 @@ const ROLE_LABELS = {
 // is what lets Suggested Prompts double as the role-selection entry
 // point alongside the explicit buttons.
 function detectRoleFromText(text) {
-  const t = text.toLowerCase();
+  const t = text.toLowerCase().trim();
+
+  // Require an "I'm ... new" self-announcement before even checking role
+  // keywords. A bare substring match on "engineer"/"design"/"pm" anywhere
+  // in the message would hijack a genuine follow-up question — e.g.
+  // "What's the engineering deploy process?" — into a full re-briefing
+  // instead of answering it. All four suggested-prompt strings ("I'm a
+  // new Engineer, brief me") satisfy this; ordinary questions don't.
+  if (!/\bi'?m\b[^.?!]*\bnew\b|\bi am\b[^.?!]*\bnew\b/.test(t)) return null;
+
   if (/\bengineer/.test(t)) return 'engineer';
   if (/\b(pm|product manager)/.test(t)) return 'pm';
   if (/\bdesign/.test(t)) return 'designer';
@@ -403,16 +427,22 @@ app.assistant(assistant);
 // now it's a nudge toward that container rather than buttons posted
 // straight into the DM — role selection itself happens inside
 // threadStarted below, once the user opens the container.
+// A user can join several channels the bot is present in before ever
+// opening the assistant pane — this event fires once per channel join,
+// not once per user. Gating on `welcomed` (set right after the DM sends,
+// separate from `briefingSent`) keeps this a one-time nudge instead of
+// one DM per channel joined.
 app.event('member_joined_channel', async ({ event, client }) => {
   const userId = event.user;
   const ctx = getContext(userId);
-  if (ctx.briefingSent) return;
+  if (ctx.briefingSent || ctx.welcomed) return;
 
   try {
     await client.chat.postMessage({
       channel: userId,
       text: `👋 *Welcome to the workspace!*\n\nI'm your onboarding assistant — open me from the *top bar* (or click here) to get a briefing built from real workspace activity, not a static doc.`,
     });
+    updateContext(userId, { welcomed: true });
   } catch (err) {
     console.error('Welcome DM error:', err.message);
   }
