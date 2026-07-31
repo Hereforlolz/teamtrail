@@ -375,6 +375,10 @@ This runs `start.sh`, which starts the Notion MCP server first if `NOTION_TOKEN`
 | `NOTION_TIMEOUT_MS` | Optional — defaults to `8000`. Max time to wait on the Notion MCP server before falling back to Slack-only content, so a hung (not just down) server can't stall a briefing |
 | `CONTEXT_STORE_PATH` | Optional — defaults to `./data/context-store.json`. Where per-user context is persisted on disk |
 | `CONTEXT_STORE_MAX_AGE_DAYS` | Optional — defaults to `90`. Entries older than this are dropped on startup so the store doesn't grow forever |
+| `NOTION_MCP_PORT` | Optional — defaults to `3331`. Used by `start.sh` to launch the Notion MCP server and to poll its `/health` endpoint before starting the bot |
+| `NOTION_READY_TIMEOUT_SECS` | Optional — defaults to `30`. How long `start.sh` waits for the Notion MCP server to report healthy before giving up |
+| `NODE_ENV` | Optional — defaults to `development`. Set to `production` and `start.sh` refuses to launch the Notion MCP server with `--unsafe-disable-auth` unless `NOTION_ALLOW_UNSAFE_AUTH=true` is also set |
+| `NOTION_ALLOW_UNSAFE_AUTH` | Optional. Explicit override required to run `start.sh`'s `--unsafe-disable-auth` Notion server launch under `NODE_ENV=production` |
 
 ---
 
@@ -384,9 +388,10 @@ This runs `start.sh`, which starts the Notion MCP server first if `NOTION_TOKEN`
 - **User/channel discovery** returns empty in sparse workspaces — this is an RTS API behaviour, not a bug. The LLM prompt handles it honestly.
 - **Single workspace** — the user token is workspace-scoped. Multi-workspace support would require per-installation token storage.
 - **Notion MCP uses the local server, not the hosted one** — Notion's remote MCP requires interactive OAuth per session, which doesn't work for a headless bot. The local server with a static integration token is the only option that fits this architecture.
-- **Notion MCP requires `--unsafe-disable-auth` for this setup** — the server's own auto-generated bearer token (separate from `NOTION_TOKEN`) rotates every restart and isn't read by `notion.js`. Disabling it is safe here since the server only listens on `127.0.0.1`, but would need real handling before any deployment beyond local development.
+- **Notion MCP requires `--unsafe-disable-auth` for this setup** — the server's own auto-generated bearer token (separate from `NOTION_TOKEN`) rotates every restart and isn't read by `notion.js`. Disabling it is safe here since the server only listens on `127.0.0.1`. `start.sh` refuses to launch it this way under `NODE_ENV=production` unless `NOTION_ALLOW_UNSAFE_AUTH=true` is explicitly set, so this can't silently ship enabled in a deployed environment.
 - **Notion page content is fetched for only the top search result** per query (`fetchContentForTop = 1` in `notion.js`), to keep prompt size and latency reasonable. Other matching pages are cited by title/URL only, without their content summarized.
 - **Slack's own MCP Server toggle is unused** — Agents & AI Apps settings expose an optional Slack MCP Server (search/post/read via MCP tools instead of direct RTS calls). This build keeps the existing direct RTS calls instead of re-platforming onto it, since it would replace already-working code with an equivalent capability rather than add a new one.
+- **The "don't invent a source" instruction is a prompt-level mitigation, not a hard guarantee** — the prompts now explicitly tell Groq to only name/link a document if it's in the numbered results, which should sharply reduce (not provably eliminate) it confidently citing something like a "Handbook" in one reply and saying it can't find a link for the same thing later. A fully deterministic fix would mean validating every citation the model outputs against the actual `sources` array before sending the reply, which this doesn't do.
 
 ## Known gotchas (Bolt for JS, `@slack/bolt@4.7.3`)
 
