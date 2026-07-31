@@ -28,6 +28,15 @@ const { StreamableHTTPClientTransport } = require('@modelcontextprotocol/sdk/cli
 
 const NOTION_MCP_URL = process.env.NOTION_MCP_URL || 'http://127.0.0.1:3331/mcp';
 
+// How long to wait on the local Notion MCP server before giving up and
+// falling back to Slack-only content. A server that's down fails fast
+// (connection refused) and is already handled below — this guards against
+// a server that's up but hung, which would otherwise block the
+// Promise.all() this is always called inside of in index.js, stalling
+// Slack results too even though the whole point of notionSearch is to
+// fail closed without affecting the rest of the pipeline.
+const NOTION_TIMEOUT_MS = Number(process.env.NOTION_TIMEOUT_MS) || 8000;
+
 let clientPromise = null;
 
 // Lazily connect once, reuse the connection across calls. If the Notion
@@ -65,6 +74,18 @@ async function getClient() {
 //   the top result via API-retrieve-page-markdown, rather than just
 //   citing a title with nothing for Groq to actually brief from.
 async function notionSearch(query, limit = 5, fetchContentForTop = 1) {
+  return Promise.race([
+    notionSearchInner(query, limit, fetchContentForTop),
+    new Promise((resolve) =>
+      setTimeout(() => {
+        console.error('Notion MCP search timed out after', NOTION_TIMEOUT_MS, 'ms');
+        resolve({ promptText: '', sources: [] });
+      }, NOTION_TIMEOUT_MS)
+    ),
+  ]);
+}
+
+async function notionSearchInner(query, limit, fetchContentForTop) {
   try {
     const client = await getClient();
 

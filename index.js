@@ -390,6 +390,7 @@ Answer concisely. Reference result numbers like [1] or [N1] when you draw on a s
       await say({ text: answer, blocks });
     } catch (err) {
       console.error('userMessage error:', err.message);
+      await say("Sorry, I ran into a problem answering that — please try again in a moment.");
     }
   },
 });
@@ -515,6 +516,7 @@ Keep it warm, concise, and actionable. Use Slack markdown (bold with *asterisks*
     await say({ text: briefing, blocks });
   } catch (err) {
     console.error('Briefing error:', err.message);
+    await say("Sorry, I ran into a problem putting together your briefing — please try again in a moment.");
   }
 }
 
@@ -547,6 +549,7 @@ const roleMap = {
 Object.entries(roleMap).forEach(([actionId, [role, roleLabel]]) => {
   app.action(actionId, async ({ body, client, ack }) => {
     await ack();
+    const userId = body.user.id;
     const sayToThread = async (payload) => {
       const msg = typeof payload === 'string' ? { text: payload } : payload;
       return client.chat.postMessage({
@@ -555,7 +558,22 @@ Object.entries(roleMap).forEach(([actionId, [role, roleLabel]]) => {
         ...msg,
       });
     };
-    await handleRoleSelection(role, roleLabel, body.user.id, sayToThread, null);
+
+    // The role buttons posted in threadStarted stay clickable for the life
+    // of the thread — Slack doesn't disable them after use. Without this
+    // guard, clicking one again after onboarding re-runs handleRoleSelection,
+    // which overwrites topicsCovered but not questionsAsked, leaving context
+    // silently inconsistent. Route repeat clicks through the same intentional
+    // reset as the Refresh button instead.
+    const ctx = getContext(userId);
+    if (ctx.briefingSent) {
+      await sayToThread(
+        "You've already got a briefing! Click *🔄 Refresh my briefing* below if you'd like a new one."
+      );
+      return;
+    }
+
+    await handleRoleSelection(role, roleLabel, userId, sayToThread, null);
   });
 });
 

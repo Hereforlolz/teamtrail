@@ -358,6 +358,7 @@ You should see:
 | `GROQ_API_KEY` | Groq API key for LLaMA 3.3 inference |
 | `NOTION_TOKEN` | Internal integration token (`ntn_...`) — set in the terminal running the Notion MCP server, not the bot's own `.env`, since the server reads it directly |
 | `NOTION_MCP_URL` | Optional — defaults to `http://127.0.0.1:3331/mcp`. Override if running the Notion MCP server on a different port |
+| `NOTION_TIMEOUT_MS` | Optional — defaults to `8000`. Max time to wait on the Notion MCP server before falling back to Slack-only content, so a hung (not just down) server can't stall a briefing |
 
 ---
 
