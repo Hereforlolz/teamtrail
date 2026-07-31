@@ -557,38 +557,46 @@ app.event('member_joined_channel', async ({ event, client }) => {
 // `say` posts into the active assistant thread (works for both the
 // button-click path and a typed "I'm an Engineer" path via userMessage).
 async function handleRoleSelection(role, roleLabel, userId, say, setStatus) {
-  updateContext(userId, { role, roleLabel });
+  // The whole function body is now one try/catch, not just the askGroq
+  // call — the initial ack `say()` below used to sit outside any guard,
+  // so a failure there (or in anything else before the old try block)
+  // propagated as an unhandled rejection with no log detail and no
+  // message to the user: a button click that silently did nothing.
+  const ctx = getContext(userId);
 
-  const article = /^[aeiou]/i.test(roleLabel) ? 'an' : 'a';
-  await say(`Got it — you're ${article} *${roleLabel}*! Pulling together your briefing... ⏳`);
-  if (setStatus) await setStatus('Searching the workspace...');
+  try {
+    updateContext(userId, { role, roleLabel });
 
-  const searchTerms = roleSearchTerms[role] || roleSearchTerms.other;
-  const notionTerms = notionSearchTerms[role] || notionSearchTerms.other;
+    const article = /^[aeiou]/i.test(roleLabel) ? 'an' : 'a';
+    await say(`Got it — you're ${article} *${roleLabel}*! Pulling together your briefing... ⏳`);
+    if (setStatus) await setStatus('Searching the workspace...');
 
-  const [messageResults, discovery, notionResult] = await Promise.all([
-    rtsSearch({ query: searchTerms, contentTypes: ['messages', 'files'], limit: 10, includeContext: true }),
-    discoverPeopleAndChannels(role),
-    notionSearch(notionTerms),
-  ]);
+    const searchTerms = roleSearchTerms[role] || roleSearchTerms.other;
+    const notionTerms = notionSearchTerms[role] || notionSearchTerms.other;
 
-  const slackCombined = formatCombinedResults(messageResults?.messages, messageResults?.files);
-  const promptText = [slackCombined.promptText, notionResult.promptText]
-    .filter(Boolean)
-    .join('\n---\n');
-  const sources = [...slackCombined.sources, ...notionResult.sources];
+    const [messageResults, discovery, notionResult] = await Promise.all([
+      rtsSearch({ query: searchTerms, contentTypes: ['messages', 'files'], limit: 10, includeContext: true }),
+      discoverPeopleAndChannels(role),
+      notionSearch(notionTerms),
+    ]);
 
-  const peopleList = discovery.users
-    .slice(0, 5)
-    .map((u) => `${u.full_name}${u.title ? ` (${u.title})` : ''}`)
-    .join(', ') || 'No specific matches found yet';
+    const slackCombined = formatCombinedResults(messageResults?.messages, messageResults?.files);
+    const promptText = [slackCombined.promptText, notionResult.promptText]
+      .filter(Boolean)
+      .join('\n---\n');
+    const sources = [...slackCombined.sources, ...notionResult.sources];
 
-  const channelList = discovery.channels
-    .slice(0, 5)
-    .map((c) => `#${c.name}`)
-    .join(', ') || 'No specific matches found yet';
+    const peopleList = discovery.users
+      .slice(0, 5)
+      .map((u) => `${u.full_name}${u.title ? ` (${u.title})` : ''}`)
+      .join(', ') || 'No specific matches found yet';
 
-  const prompt = `You are an intelligent onboarding assistant for a new ${roleLabel} joining a Slack workspace.
+    const channelList = discovery.channels
+      .slice(0, 5)
+      .map((c) => `#${c.name}`)
+      .join(', ') || 'No specific matches found yet';
+
+    const prompt = `You are an intelligent onboarding assistant for a new ${roleLabel} joining a Slack workspace.
 
 Based on the following recent Slack messages and files, plus any relevant Notion pages (marked with [N1], [N2], etc., with surrounding context where available), create a personalised onboarding briefing.
 
@@ -607,14 +615,18 @@ Write a briefing that includes:
 
 Keep it warm, concise, and actionable. Use Slack markdown (bold with *asterisks*, bullets with •). If no real people/channels were found, say so honestly instead of making something up. If no Notion content was found, don't mention Notion at all — just use what's available. Only mention a specific document, page, or resource (like a handbook or guide) if it appears in the numbered results above — don't invent a title for something that isn't actually there.`;
 
-  if (setStatus) await setStatus('Writing your briefing...');
+    if (setStatus) await setStatus('Writing your briefing...');
 
-  try {
     const briefing = await askGroq(prompt);
 
+    // Append, don't replace — this can run for a user who already asked
+    // follow-up questions (and accumulated topicsCovered) before ever
+    // selecting a role, since Route 2 in userMessage never required a
+    // role/briefing to exist first. Overwriting here silently discarded
+    // that history.
     updateContext(userId, {
       briefingSent: true,
-      topicsCovered: [role, 'initial briefing'],
+      topicsCovered: [...ctx.topicsCovered, role, 'initial briefing'],
     });
 
     const sourcesBlock = formatSourcesBlock(sources);
@@ -650,8 +662,12 @@ Keep it warm, concise, and actionable. Use Slack markdown (bold with *asterisks*
 
     await say({ text: briefing, blocks });
   } catch (err) {
-    console.error('Briefing error:', err.message);
-    await say("Sorry, I ran into a problem putting together your briefing — please try again in a moment.");
+    console.error(`handleRoleSelection failed for role "${role}" (user ${userId}):`, err);
+    try {
+      await say("Sorry, I ran into a problem putting together your briefing — please try again in a moment.");
+    } catch (sayErr) {
+      console.error(`Also failed to notify user ${userId} about the briefing error:`, sayErr);
+    }
   }
 }
 
@@ -674,47 +690,77 @@ app.action('refresh_briefing', async ({ ack, body, client }) => {
 });
 
 // ── Role button handlers ──────────────────────────────────
+// Keys here must be the same canonical roles used by roleSearchTerms /
+// notionSearchTerms / ROLE_LABELS ('engineer' / 'pm' / 'designer' /
+// 'other'). This used to hardcode a separate, drifted set of strings
+// ('product manager', 'design', 'general onboarding') that matched
+// nothing else in the file — roleButtons above already carries the
+// correct keys as each button's `value`, but that value was never read.
+// The mismatch had two consequences: role/roleLabel written to the
+// context store from a button click didn't match what extractStatedRole
+// or detectRoleFromText would ever produce for the same role, and
+// roleSearchTerms[role] / notionSearchTerms[role] silently missed for
+// PM, Designer, and Other, falling back to the generic 'other' search
+// terms for every role except Engineer. Deriving roleLabel from
+// ROLE_LABELS instead of a second hardcoded string removes the
+// possibility of this drifting again.
 const roleMap = {
-  role_engineer: ['engineer', 'Engineer'],
-  role_pm: ['product manager', 'Product Manager'],
-  role_designer: ['design', 'Designer'],
-  role_other: ['general onboarding', 'New Member'],
+  role_engineer: 'engineer',
+  role_pm: 'pm',
+  role_designer: 'designer',
+  role_other: 'other',
 };
 
-Object.entries(roleMap).forEach(([actionId, [role, roleLabel]]) => {
+Object.entries(roleMap).forEach(([actionId, role]) => {
   app.action(actionId, async ({ body, client, ack }) => {
     await ack();
     const userId = body.user.id;
+    const roleLabel = ROLE_LABELS[role];
+    const channel = body.channel?.id || body.user.id;
+    const threadTs = body.container?.thread_ts;
     const sayToThread = async (payload) => {
       const msg = typeof payload === 'string' ? { text: payload } : payload;
-      return client.chat.postMessage({
-        channel: body.channel?.id || body.user.id,
-        thread_ts: body.container?.thread_ts,
-        ...msg,
-      });
+      return client.chat.postMessage({ channel, thread_ts: threadTs, ...msg });
     };
 
-    // Wrapped in the same serializedPerUser queue userMessage uses, so a
-    // button click and a typed follow-up for the same user can't race
-    // each other's context reads/writes either.
-    await serializedPerUser(userId, async () => {
-      // The role buttons posted in threadStarted stay clickable for the
-      // life of the thread — Slack doesn't disable them after use.
-      // Without this guard, clicking one again after onboarding re-runs
-      // handleRoleSelection, which overwrites topicsCovered but not
-      // questionsAsked, leaving context silently inconsistent. Route
-      // repeat clicks through the same intentional reset as the Refresh
-      // button instead.
-      const ctx = getContext(userId);
-      if (ctx.briefingSent) {
-        await sayToThread(
-          "You've already got a briefing! Click *🔄 Refresh my briefing* below if you'd like a new one."
-        );
-        return;
-      }
+    // Outer safety net around the whole handler, on top of
+    // handleRoleSelection's own internal try/catch — a role button click
+    // was observed producing no visible response in Slack at all, with
+    // nothing logged; this makes sure that can't happen silently again,
+    // whatever the actual cause turns out to be.
+    try {
+      // Wrapped in the same serializedPerUser queue userMessage uses, so
+      // a button click and a typed follow-up for the same user can't
+      // race each other's context reads/writes either.
+      await serializedPerUser(userId, async () => {
+        // The role buttons posted in threadStarted stay clickable for the
+        // life of the thread — Slack doesn't disable them after use.
+        // Without this guard, clicking one again after onboarding re-runs
+        // handleRoleSelection, which used to overwrite topicsCovered
+        // (now fixed to append instead). Route repeat clicks through the
+        // same intentional reset as the Refresh button instead.
+        const ctx = getContext(userId);
+        if (ctx.briefingSent) {
+          await sayToThread(
+            "You've already got a briefing! Click *🔄 Refresh my briefing* below if you'd like a new one."
+          );
+          return;
+        }
 
-      await handleRoleSelection(role, roleLabel, userId, sayToThread, null);
-    });
+        await handleRoleSelection(role, roleLabel, userId, sayToThread, null);
+      });
+    } catch (err) {
+      console.error(`Role button handler (${actionId}) failed for user ${userId}:`, err);
+      try {
+        await client.chat.postMessage({
+          channel,
+          thread_ts: threadTs,
+          text: 'Sorry, something went wrong handling that — please try again.',
+        });
+      } catch (notifyErr) {
+        console.error(`Also failed to notify user ${userId} after a role button error:`, notifyErr);
+      }
+    }
   });
 });
 
