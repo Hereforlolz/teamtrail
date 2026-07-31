@@ -3,6 +3,40 @@ const { App, Assistant } = require('@slack/bolt');
 const Groq = require('groq-sdk');
 const axios = require('axios');
 const { notionSearch } = require('./notion');
+const { getContext, updateContext } = require('./store');
+
+// ── Fail fast on missing config ───────────────────────────
+// Without this, a missing token surfaces later as an opaque auth error
+// from deep inside Bolt or the Groq SDK on the first real event, instead
+// of a clear message at boot. NOTION_TOKEN is intentionally excluded —
+// it's read by the separate Notion MCP server process, not this one.
+const REQUIRED_ENV_VARS = [
+  'SLACK_BOT_TOKEN',
+  'SLACK_USER_TOKEN',
+  'SLACK_SIGNING_SECRET',
+  'SLACK_APP_TOKEN',
+  'GROQ_API_KEY',
+];
+const missingEnvVars = REQUIRED_ENV_VARS.filter((name) => !process.env[name]);
+if (missingEnvVars.length) {
+  console.error(`Missing required environment variable(s): ${missingEnvVars.join(', ')}`);
+  console.error('Copy .env.example to .env and fill these in before starting the bot.');
+  process.exit(1);
+}
+
+// ── Crash resilience ───────────────────────────────────────
+// Node treats an unhandled promise rejection anywhere in the app as
+// fatal by default — logging it instead keeps one missed .catch() from
+// taking the whole bot down. uncaughtException logs and exits
+// deliberately instead of trying to resume, since process state may be
+// corrupt at that point; start.sh's restart loop brings it back up.
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled promise rejection:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception, exiting:', err);
+  process.exit(1);
+});
 
 // ── Clients ──────────────────────────────────────────────
 const app = new App({
@@ -14,28 +48,10 @@ const app = new App({
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// ── In-memory context store ───────────────────────────────
-const contextStore = {};
-
-function getContext(userId) {
-  if (!contextStore[userId]) {
-    contextStore[userId] = {
-      userId,
-      role: null,
-      roleLabel: null,
-      joinedAt: new Date().toISOString(),
-      topicsCovered: [],
-      questionsAsked: [],
-      briefingSent: false,
-      welcomed: false,
-    };
-  }
-  return contextStore[userId];
-}
-
-function updateContext(userId, updates) {
-  contextStore[userId] = { ...getContext(userId), ...updates };
-}
+// ── Context store ──────────────────────────────────────────
+// getContext/updateContext are now backed by a JSON file on disk (see
+// store.js) instead of a plain in-memory object, so per-user state
+// survives a process restart.
 
 // ── Role selection buttons ────────────────────────────────
 const roleButtons = [

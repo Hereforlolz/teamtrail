@@ -213,9 +213,13 @@ Notion sources are merged into the same `sources` array as Slack messages/files,
 ```
 ├── index.js            # Main bot — Assistant lifecycle, RTS calls, Groq prompts
 ├── notion.js           # Notion MCP client — connects to a locally-run Notion MCP server
+├── store.js            # Persistent per-user context store (JSON file on disk)
+├── start.sh            # Runs the bot + local Notion MCP server together, restarts on crash
 ├── test_rts.sh         # Standalone RTS smoke tester (run before deploying)
 ├── test_notion_mcp.js  # Standalone Notion MCP smoke tester — confirms real tool names/shapes
 ├── .env                # Secrets (not committed)
+├── .env.example        # Template for .env — copy and fill in
+├── data/               # Persisted context store (git-ignored, created on first run)
 ├── package.json
 └── README.md
 ```
@@ -326,6 +330,8 @@ If the Notion MCP server isn't running, the bot still works — `notionSearch()`
 
 ### 9. Start the bot
 
+The bot checks `SLACK_BOT_TOKEN`, `SLACK_USER_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_APP_TOKEN`, and `GROQ_API_KEY` at startup and refuses to start with a clear message if any are missing — see `.env.example`.
+
 ```bash
 node index.js
 ```
@@ -334,6 +340,14 @@ You should see:
 ```
 ⚡ TeamTrail is running!
 ```
+
+To also start the local Notion MCP server automatically (instead of running it in a separate terminal per step 8) and have the bot restart itself if it crashes:
+
+```bash
+npm run start:all
+```
+
+This runs `start.sh`, which starts the Notion MCP server first if `NOTION_TOKEN` is set (skipped otherwise — the bot still runs fine Slack-only), then starts the bot in a restart loop. If you're deploying this behind a process supervisor (systemd, Docker, pm2), point it at `start.sh` rather than `node index.js` directly, so the Notion server stays paired with the bot across restarts.
 
 ---
 
@@ -359,12 +373,14 @@ You should see:
 | `NOTION_TOKEN` | Internal integration token (`ntn_...`) — set in the terminal running the Notion MCP server, not the bot's own `.env`, since the server reads it directly |
 | `NOTION_MCP_URL` | Optional — defaults to `http://127.0.0.1:3331/mcp`. Override if running the Notion MCP server on a different port |
 | `NOTION_TIMEOUT_MS` | Optional — defaults to `8000`. Max time to wait on the Notion MCP server before falling back to Slack-only content, so a hung (not just down) server can't stall a briefing |
+| `CONTEXT_STORE_PATH` | Optional — defaults to `./data/context-store.json`. Where per-user context is persisted on disk |
+| `CONTEXT_STORE_MAX_AGE_DAYS` | Optional — defaults to `90`. Entries older than this are dropped on startup so the store doesn't grow forever |
 
 ---
 
 ## Known limitations
 
-- **State is in-memory** — context resets on process restart. A Redis or SQLite layer would make it persistent across deployments. Per Slack's guidance for Agents & AI Apps, only metadata (role, topics, question text) is stored — never raw Slack message content.
+- **State persists to a local JSON file (`store.js`), not a database** — survives process restarts (an upgrade from the earlier fully in-memory version), but doesn't survive the disk itself disappearing, and isn't safe for multiple bot instances writing concurrently. Fine for a single always-running process; would need a real database if this ever ran as more than one instance. Per Slack's guidance for Agents & AI Apps, only metadata (role, topics, question text) is stored — never raw Slack message content.
 - **User/channel discovery** returns empty in sparse workspaces — this is an RTS API behaviour, not a bug. The LLM prompt handles it honestly.
 - **Single workspace** — the user token is workspace-scoped. Multi-workspace support would require per-installation token storage.
 - **Notion MCP uses the local server, not the hosted one** — Notion's remote MCP requires interactive OAuth per session, which doesn't work for a headless bot. The local server with a static integration token is the only option that fits this architecture.
