@@ -399,6 +399,23 @@ function extractStatedRole(text) {
   return { role, label: titleCase(phrase) };
 }
 
+// Lets someone explicitly (re)start the role-selection flow on demand —
+// by typing this in the assistant pane, or via the /onboard slash
+// command below — instead of only via the Refresh button on an existing
+// briefing, or a fresh channel-join event. Closes a real gap: someone
+// who missed or dismissed their original welcome message had no way
+// back into onboarding at all before this.
+const ONBOARD_REQUEST_PATTERN = /\b(re)?-?onboard(ing)?\s*me\b|\b(start|restart)\s+(my\s+)?onboarding\b/i;
+
+function isOnboardRequest(text) {
+  return ONBOARD_REQUEST_PATTERN.test(text.trim());
+}
+
+async function restartOnboarding(userId, say) {
+  updateContext(userId, { briefingSent: false, topicsCovered: [] });
+  await say(buildRoleBlock(`👋 *Let's get you onboarded — what's your role?*`));
+}
+
 const assistant = new Assistant({
   threadStarted: async ({ say, setSuggestedPrompts, saveThreadContext }) => {
     await say(
@@ -435,6 +452,14 @@ const assistant = new Assistant({
     // see the comment on serializedPerUser above.
     await serializedPerUser(userId, async () => {
       const ctx = getContext(userId);
+
+      // Route 0: explicit request to (re)start onboarding — works even
+      // after a briefing has already been sent, unlike Route 1 below, so
+      // this isn't limited to the Refresh button or a fresh join event.
+      if (isOnboardRequest(question)) {
+        await restartOnboarding(userId, say);
+        return;
+      }
 
       // Route 1: role pick typed via suggested prompt instead of button click
       const detectedRole = detectRoleFromText(question);
@@ -525,6 +550,36 @@ Answer concisely. Reference result numbers like [1] or [N1] when you draw on a s
 });
 
 app.assistant(assistant);
+
+// ── Manual onboarding trigger (/onboard slash command) ────
+// A more discoverable alternative to typing "onboard me" in the
+// assistant pane (Route 0 in userMessage above): this works from
+// anywhere — a DM or a channel — and doesn't require already being
+// inside, or even knowing about, the assistant container. That makes it
+// the better answer for someone who missed their onboarding message
+// entirely and has no idea the pane exists, versus a tester who's
+// already in the pane and just wants a fast way to restart the flow.
+//
+// Inert until /onboard is registered under Slash Commands in the Slack
+// app config (api.slack.com/apps) and the `commands` scope is added and
+// the app reinstalled — see README. Until that's done, Slack has nothing
+// to route to this handler, so shipping it now is safe either way.
+app.command('/onboard', async ({ command, ack, respond }) => {
+  await ack();
+  const userId = command.user_id;
+  if (!userId) return;
+
+  try {
+    await serializedPerUser(userId, () => restartOnboarding(userId, respond));
+  } catch (err) {
+    console.error(`/onboard command failed for user ${userId}:`, err);
+    try {
+      await respond('Sorry, something went wrong starting onboarding — please try again.');
+    } catch (respondErr) {
+      console.error(`Also failed to notify user ${userId} after an /onboard error:`, respondErr);
+    }
+  }
+});
 
 // ── Step 1: New member joined ─────────────────────────────
 // With Agents & AI Apps enabled, the assistant container (top bar /
