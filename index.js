@@ -399,20 +399,41 @@ function extractStatedRole(text) {
   return { role, label: titleCase(phrase) };
 }
 
-// Lets someone explicitly (re)start the role-selection flow on demand —
-// by typing this in the assistant pane, or via the /onboard slash
-// command below — instead of only via the Refresh button on an existing
-// briefing, or a fresh channel-join event. Closes a real gap: someone
-// who missed or dismissed their original welcome message had no way
-// back into onboarding at all before this.
+// Lets someone explicitly ask for onboarding on demand — by typing this
+// in the assistant pane, or via the /onboard slash command below —
+// instead of only via a fresh channel-join event. Closes a real gap:
+// someone who missed or dismissed their original welcome message had no
+// way back into onboarding at all before this.
 const ONBOARD_REQUEST_PATTERN = /\b(re)?-?onboard(ing)?\s*me\b|\b(start|restart)\s+(my\s+)?onboarding\b/i;
 
 function isOnboardRequest(text) {
   return ONBOARD_REQUEST_PATTERN.test(text.trim());
 }
 
-async function restartOnboarding(userId, say) {
-  updateContext(userId, { briefingSent: false, topicsCovered: [] });
+// Deliberately NOT a blanket reset. TeamTrail is meant to keep working
+// as an ongoing internal assistant once someone's been onboarded, not
+// snap back to a blank slate every time this phrase comes up — an
+// employee is onboarded once, not repeatedly. So this only shows the
+// role-selection flow for someone who was never onboarded in the first
+// place (briefingSent: false), and it doesn't touch topicsCovered even
+// then — follow-up questions asked before ever completing onboarding
+// shouldn't be discarded just because onboarding is happening now.
+// For someone who's already onboarded, this is a no-op on their state:
+// it just tells them so and keeps them in the conversation. The
+// existing 🔄 Refresh my briefing button remains the one deliberate,
+// explicit way to actually wipe state and start over — a labeled button
+// click is a much clearer "I want a full reset" signal than this
+// loosely-typed phrase, so its behavior is unchanged.
+async function handleOnboardRequest(userId, say) {
+  const ctx = getContext(userId);
+
+  if (ctx.briefingSent) {
+    await say(
+      `You're already onboarded${ctx.roleLabel ? ` as a *${ctx.roleLabel}*` : ''} — just ask me anything and I'll keep helping. Click *🔄 Refresh my briefing* on your original briefing if you'd like a completely fresh one.`
+    );
+    return;
+  }
+
   await say(buildRoleBlock(`👋 *Let's get you onboarded — what's your role?*`));
 }
 
@@ -453,11 +474,12 @@ const assistant = new Assistant({
     await serializedPerUser(userId, async () => {
       const ctx = getContext(userId);
 
-      // Route 0: explicit request to (re)start onboarding — works even
-      // after a briefing has already been sent, unlike Route 1 below, so
-      // this isn't limited to the Refresh button or a fresh join event.
+      // Route 0: explicit request for onboarding — not limited to a
+      // fresh join event. Safe to check before briefingSent: for someone
+      // already onboarded this is a no-op that just replies in place,
+      // it doesn't reset anything (see handleOnboardRequest).
       if (isOnboardRequest(question)) {
-        await restartOnboarding(userId, say);
+        await handleOnboardRequest(userId, say);
         return;
       }
 
@@ -557,8 +579,8 @@ app.assistant(assistant);
 // anywhere — a DM or a channel — and doesn't require already being
 // inside, or even knowing about, the assistant container. That makes it
 // the better answer for someone who missed their onboarding message
-// entirely and has no idea the pane exists, versus a tester who's
-// already in the pane and just wants a fast way to restart the flow.
+// entirely and has no idea the pane exists. Same non-destructive
+// semantics as Route 0 — see handleOnboardRequest above.
 //
 // Inert until /onboard is registered under Slash Commands in the Slack
 // app config (api.slack.com/apps) and the `commands` scope is added and
@@ -570,7 +592,7 @@ app.command('/onboard', async ({ command, ack, respond }) => {
   if (!userId) return;
 
   try {
-    await serializedPerUser(userId, () => restartOnboarding(userId, respond));
+    await serializedPerUser(userId, () => handleOnboardRequest(userId, respond));
   } catch (err) {
     console.error(`/onboard command failed for user ${userId}:`, err);
     try {

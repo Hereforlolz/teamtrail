@@ -60,7 +60,7 @@ Follow-up question typed in the pane  →  same combined search  →  Groq answe
 - **Stateful per-user context** — tracks role, topics covered, and questions asked across the session; the LLM is explicitly told not to repeat topics already covered
 - **Follow-up questions in-thread** — just type in the assistant pane; same RTS + Groq pipeline that used to live behind `/ask`, with session context carried over
 - **Refresh briefing** button — clears state and restarts the onboarding flow
-- **Manual onboarding trigger** — type "onboard me" in the assistant pane, or use the optional `/onboard` slash command from anywhere, to (re)start onboarding without needing a fresh channel-join event — covers someone who missed or dismissed their original welcome message, not just testing convenience
+- **Manual onboarding trigger** — type "onboard me" in the assistant pane, or use the optional `/onboard` slash command from anywhere, to start onboarding without needing a fresh channel-join event — covers someone who missed or dismissed their original welcome message. Deliberately not a reset: an employee is onboarded once, then TeamTrail keeps working as an ongoing internal assistant — for someone already onboarded, this just replies to say so instead of wiping their history. **🔄 Refresh my briefing** remains the one explicit, deliberate way to actually start over
 - **Graceful sparse-workspace handling** — if RTS returns no users or channels (expected in sandboxes with limited history), the LLM is prompted to say so honestly rather than hallucinate people or channel names
 - **File search** — RTS also searches `files`, not just `messages`, surfacing PRDs and architecture docs shared in Slack
 - **Notion MCP integration** — optionally pulls relevant Notion pages into the same briefing/answer pipeline via a locally-run Notion MCP server, merged into one prompt alongside Slack messages and files
@@ -284,12 +284,14 @@ If you'd already installed the app before enabling Agents & AI Apps, you must **
 
 ### Optional: `/onboard` slash command
 
-Anyone can already restart onboarding by typing "onboard me" (or "restart onboarding", etc.) directly in the assistant pane — that needs no setup and works today. A `/onboard` slash command is also built in as a more discoverable alternative: it works from anywhere (a DM or a channel), not just from inside the assistant pane, which matters for someone who missed their onboarding message entirely and doesn't know the pane exists. It's inert until you activate it:
+Anyone can already ask for onboarding by typing "onboard me" (or "restart onboarding", etc.) directly in the assistant pane — that needs no setup and works today. A `/onboard` slash command is also built in as a more discoverable alternative: it works from anywhere (a DM or a channel), not just from inside the assistant pane, which matters for someone who missed their onboarding message entirely and doesn't know the pane exists. It's inert until you activate it:
 
 1. In the left sidebar, go to **Slash Commands** → **Create New Command**
-2. Command: `/onboard`, short description: e.g. "Restart the TeamTrail onboarding flow" — no Request URL needed, since this app uses Socket Mode
+2. Command: `/onboard`, short description: e.g. "Get onboarded with TeamTrail" — no Request URL needed, since this app uses Socket Mode
 3. Save, then add the `commands` scope under **OAuth & Permissions** (Bot Token Scopes) if it isn't already there
 4. Reinstall the app (same as step 4 above) for the new scope to take effect
+
+Neither trigger resets an already-onboarded user's state — an employee is onboarded once, then TeamTrail keeps acting as their ongoing internal assistant. For someone already onboarded, both just reply to say so and point to the **Refresh** button instead of wiping anything.
 
 ### 5. Clone and install
 
@@ -367,7 +369,7 @@ This runs `start.sh`, which starts the Notion MCP server first if `NOTION_TOKEN`
 2. Pick a role — click a button, or use one of the suggested prompts
 3. A personalised briefing posts in the same pane within a few seconds, with cited sources
 4. Type any follow-up question directly in the pane — the bot remembers what's already been covered and won't repeat itself
-5. Click **🔄 Refresh my briefing** at any time to restart, or type "onboard me" (also works even before a briefing has ever been sent — e.g. if the welcome DM was missed or dismissed), or use `/onboard` from anywhere if the slash command is set up (see Setup)
+5. Click **🔄 Refresh my briefing** at any time for a fresh briefing. Missed onboarding entirely? Type "onboard me" in the pane, or use `/onboard` from anywhere if the slash command is set up (see Setup) — for someone already onboarded, these just confirm that and point to Refresh, rather than resetting anything
 
 ---
 
