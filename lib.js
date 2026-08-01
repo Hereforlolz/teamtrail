@@ -167,12 +167,13 @@ function formatSourcesBlock(sources) {
 // Role keyword patterns shared by detectRoleFromText (the full-briefing
 // trigger) and extractStatedRole (inline role capture in follow-ups
 // below) — one shared list so a title like "Product Owner" is recognized
-// consistently in both places instead of silently diverging.
-const ROLE_KEYWORD_PATTERNS = {
-  engineer: [/\bengineer(ing)?\b/, /\bdeveloper\b/, /\bswe\b/],
-  pm: [/\bproduct manager\b/, /\bproduct owner\b/, /\bpm\b/, /\bpo\b/],
-  designer: [/\bdesigner\b/, /\bdesign\b/],
-};
+// consistently in both places instead of silently diverging. Derived
+// from roles.js (the single source of truth for role configuration,
+// shared with index.js) instead of a second, independently-maintained
+// copy — that exact kind of drift between two role lists is what caused
+// a real bug earlier (roleMap using different keys than everything else).
+const ROLES = require('./roles');
+const ROLE_KEYWORD_PATTERNS = Object.fromEntries(ROLES.map((r) => [r.id, r.keywordPatterns]));
 
 function matchRoleKeyword(text) {
   for (const [role, patterns] of Object.entries(ROLE_KEYWORD_PATTERNS)) {
@@ -237,6 +238,42 @@ function isOnboardRequest(text) {
   return ONBOARD_REQUEST_PATTERN.test(text.trim());
 }
 
+// Aggregates the per-user context snapshot from store.js's
+// getAllContexts() into the numbers the /teamtrail-status admin command
+// reports. Pure — takes the snapshot object, returns a plain summary,
+// touches nothing else.
+function computeStats(contexts) {
+  const users = Object.values(contexts);
+  const onboarded = users.filter((u) => u.briefingSent);
+
+  const roleBreakdown = {};
+  for (const u of onboarded) {
+    const label = u.roleLabel || 'Unknown';
+    roleBreakdown[label] = (roleBreakdown[label] || 0) + 1;
+  }
+
+  const totalQuestions = users.reduce((sum, u) => sum + (u.questionsAsked?.length || 0), 0);
+  const feedbackUp = users.reduce((sum, u) => sum + (u.feedback?.up || 0), 0);
+  const feedbackDown = users.reduce((sum, u) => sum + (u.feedback?.down || 0), 0);
+
+  return {
+    totalUsers: users.length,
+    totalOnboarded: onboarded.length,
+    roleBreakdown,
+    totalQuestions,
+    feedbackUp,
+    feedbackDown,
+  };
+}
+
+// Simple allowlist check for admin-only commands (/teamtrail-status).
+// Takes the parsed list as a parameter rather than reading process.env
+// itself, so this stays pure and testable — index.js parses
+// ADMIN_USER_IDS once and passes it in.
+function isAdmin(userId, adminUserIds) {
+  return adminUserIds.includes(userId);
+}
+
 module.exports = {
   isRateLimited,
   asSemanticQuery,
@@ -249,4 +286,6 @@ module.exports = {
   detectRoleFromText,
   extractStatedRole,
   isOnboardRequest,
+  computeStats,
+  isAdmin,
 };

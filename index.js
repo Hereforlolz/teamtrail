@@ -3,7 +3,8 @@ const { App, Assistant } = require('@slack/bolt');
 const Groq = require('groq-sdk');
 const axios = require('axios');
 const { notionSearch } = require('./notion');
-const { getContext, updateContext } = require('./store');
+const { getContext, updateContext, getAllContexts } = require('./store');
+const ROLES = require('./roles');
 const {
   isRateLimited,
   asSemanticQuery,
@@ -16,7 +17,21 @@ const {
   detectRoleFromText,
   extractStatedRole,
   isOnboardRequest,
+  computeStats,
+  isAdmin,
 } = require('./lib');
+
+// Who can run /teamtrail-status. Comma-separated Slack user IDs, e.g.
+// "U01ABCDEF,U02GHIJKL" — a plain env-var allowlist rather than an extra
+// Slack API call (users.info) to check admin/owner status, since that
+// would mean a new scope and a network round-trip on every check for
+// something a one-time env var setting already covers.
+const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const PROCESS_STARTED_AT = Date.now();
 
 // ── Fail fast on missing config ───────────────────────────
 // Without this, a missing token surfaces later as an opaque auth error
@@ -107,12 +122,12 @@ function serializedPerUser(userId, task) {
 const RATE_LIMIT_MESSAGE = "You're sending requests a bit fast — please wait a moment and try again.";
 
 // ── Role selection buttons ────────────────────────────────
-const roleButtons = [
-  { text: '⚙️ Engineer', value: 'engineer', action_id: 'role_engineer' },
-  { text: '📋 Product Manager', value: 'pm', action_id: 'role_pm' },
-  { text: '🎨 Designer', value: 'designer', action_id: 'role_designer' },
-  { text: '📊 Other', value: 'other', action_id: 'role_other' },
-];
+// Derived from roles.js — add a role there, not here.
+const roleButtons = ROLES.map((r) => ({
+  text: `${r.emoji} ${r.buttonLabel}`,
+  value: r.id,
+  action_id: `role_${r.id}`,
+}));
 
 function buildRoleBlock(headerText) {
   const blocks = [];
@@ -135,26 +150,29 @@ function buildRoleBlock(headerText) {
   return { text: headerText && headerText.trim() ? headerText : 'Pick your role:', blocks };
 }
 
-// ── Role → search expansion ───────────────────────────────
-// RTS supports the OR operator natively. Expanding a bare role into
-// related terms gives the search far better recall than the literal
-// role word alone, and is a real (not cosmetic) use of RTS query syntax.
-const roleSearchTerms = {
-  engineer: 'engineering OR backend OR infrastructure OR deployment OR architecture',
-  pm: 'roadmap OR product OR launch OR prioritization OR planning',
-  designer: 'design OR UX OR figma OR prototype OR user research',
-  other: 'onboarding OR team OR projects OR goals',
-};
+// Appended to both briefings and follow-up answers. Feedback is tracked
+// per-user (see the feedback_up/feedback_down action handlers below),
+// aggregated into /teamtrail-status — real signal on answer quality for
+// close to no cost to add, versus no feedback mechanism at all today.
+function buildFeedbackBlock() {
+  return {
+    type: 'actions',
+    block_id: 'feedback',
+    elements: [
+      { type: 'button', text: { type: 'plain_text', text: '👍' }, value: 'up', action_id: 'feedback_up' },
+      { type: 'button', text: { type: 'plain_text', text: '👎' }, value: 'down', action_id: 'feedback_down' },
+    ],
+  };
+}
 
-// Notion's search tool takes a plain-text query, not RTS's OR-operator
-// syntax — a separate, simpler term per role rather than reusing
-// roleSearchTerms with the operators stripped out at runtime.
-const notionSearchTerms = {
-  engineer: 'engineering architecture deployment',
-  pm: 'roadmap product launch',
-  designer: 'design UX prototype',
-  other: 'onboarding team',
-};
+// ── Role → search expansion ───────────────────────────────
+// Both derived from roles.js. RTS supports the OR operator natively —
+// expanding a bare role into related terms gives the search far better
+// recall than the literal role word alone. Notion's search tool takes a
+// plain-text query, not RTS's OR syntax, hence the separate field rather
+// than reusing roleSearchTerms with the operators stripped at runtime.
+const roleSearchTerms = Object.fromEntries(ROLES.map((r) => [r.id, r.searchTerms]));
+const notionSearchTerms = Object.fromEntries(ROLES.map((r) => [r.id, r.notionSearchTerms]));
 
 // asSemanticQuery lives in lib.js (pure logic, unit tested there).
 
@@ -247,12 +265,8 @@ async function askGroq(prompt, maxTokens = 1024) {
 // Assistant instance into a valid middleware function before pushing it —
 // app.use(assistant) does NOT do this conversion and causes
 // "middleware[toCallMiddlewareIndex] is not a function" on every event.
-const ROLE_LABELS = {
-  engineer: 'Engineer',
-  pm: 'Product Manager',
-  designer: 'Designer',
-  other: 'New Member',
-};
+// Derived from roles.js.
+const ROLE_LABELS = Object.fromEntries(ROLES.map((r) => [r.id, r.label]));
 
 // matchRoleKeyword, titleCase, detectRoleFromText, extractStatedRole,
 // and isOnboardRequest all live in lib.js (pure logic, unit tested
@@ -421,6 +435,7 @@ Answer concisely. Reference result numbers like [1] or [N1] when you draw on a s
         const sourcesBlock = formatSourcesBlock(sources);
         const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: answer } }];
         if (sourcesBlock) blocks.push(sourcesBlock);
+        blocks.push(buildFeedbackBlock());
 
         await say({ text: answer, blocks });
       } catch (err) {
@@ -458,7 +473,67 @@ app.command('/onboard', async ({ command, ack, respond }) => {
     try {
       await respond('Sorry, something went wrong starting onboarding — please try again.');
     } catch (respondErr) {
-      console.error(`Also failed to notify user ${userId} after an /onboard error:`, respondErr);
+      logError(`Also failed to notify user ${userId} after an /onboard error:`, respondErr);
+    }
+  }
+});
+
+// ── Admin status/stats (/teamtrail-status slash command) ──
+// Combines usage stats and a basic liveness signal into one admin-only
+// reply. A slash command is the most practical liveness check available
+// here: this app runs over Socket Mode with no HTTP endpoint to ping,
+// so "can it still respond to a command" plus "how long has it been up"
+// is the signal that's actually available without adding paid
+// infrastructure. Gated on ADMIN_USER_IDS — usage data (even just
+// aggregate counts) about other users shouldn't be visible to everyone,
+// including recruiters/testers poking at the demo.
+//
+// Inert until /teamtrail-status is registered the same way /onboard is
+// — see README.
+app.command('/teamtrail-status', async ({ command, ack, respond }) => {
+  await ack();
+  const userId = command.user_id;
+  if (!userId) return;
+
+  if (!isAdmin(userId, ADMIN_USER_IDS)) {
+    await respond("This command is only available to TeamTrail's admins.");
+    return;
+  }
+
+  try {
+    const stats = computeStats(getAllContexts());
+    const uptimeMs = Date.now() - PROCESS_STARTED_AT;
+    const uptimeMinutes = Math.floor(uptimeMs / 60000);
+    const uptimeText =
+      uptimeMinutes < 60
+        ? `${uptimeMinutes}m`
+        : `${Math.floor(uptimeMinutes / 60)}h ${uptimeMinutes % 60}m`;
+
+    const roleLines =
+      Object.entries(stats.roleBreakdown)
+        .map(([label, count]) => `  • ${label}: ${count}`)
+        .join('\n') || '  • None yet';
+
+    await respond(
+      [
+        `*TeamTrail status*`,
+        `Uptime since last restart: ${uptimeText}`,
+        ``,
+        `*Usage*`,
+        `Users tracked: ${stats.totalUsers}`,
+        `Onboarded: ${stats.totalOnboarded}`,
+        `Role breakdown:`,
+        roleLines,
+        `Total questions asked: ${stats.totalQuestions}`,
+        `Feedback: 👍 ${stats.feedbackUp}  👎 ${stats.feedbackDown}`,
+      ].join('\n')
+    );
+  } catch (err) {
+    logError(`/teamtrail-status failed for user ${userId}:`, err);
+    try {
+      await respond('Sorry, something went wrong computing status — please try again.');
+    } catch (respondErr) {
+      logError(`Also failed to notify user ${userId} after a /teamtrail-status error:`, respondErr);
     }
   }
 });
@@ -581,6 +656,7 @@ Keep it warm, concise, and actionable. Use Slack markdown (bold with *asterisks*
       },
     ];
     if (sourcesBlock) blocks.push(sourcesBlock);
+    blocks.push(buildFeedbackBlock());
     blocks.push(
       { type: 'divider' },
       {
@@ -610,7 +686,7 @@ Keep it warm, concise, and actionable. Use Slack markdown (bold with *asterisks*
     try {
       await say("Sorry, I ran into a problem putting together your briefing — please try again in a moment.");
     } catch (sayErr) {
-      console.error(`Also failed to notify user ${userId} about the briefing error:`, sayErr);
+      logError(`Also failed to notify user ${userId} about the briefing error:`, sayErr);
     }
   }
 }
@@ -633,27 +709,53 @@ app.action('refresh_briefing', async ({ ack, body, client }) => {
   });
 });
 
+// ── Feedback buttons ──────────────────────────────────────
+// Aggregated into /teamtrail-status. `replace_original: false` matters
+// here specifically: respond() from a response_url replaces the
+// original message by default, which would wipe out the actual
+// briefing/answer the buttons are attached to — this posts a small new
+// ephemeral acknowledgment instead.
+async function recordFeedback(userId, kind) {
+  const ctx = getContext(userId);
+  const feedback = { up: ctx.feedback?.up || 0, down: ctx.feedback?.down || 0 };
+  feedback[kind] += 1;
+  updateContext(userId, { feedback });
+}
+
+app.action('feedback_up', async ({ ack, body, respond }) => {
+  await ack();
+  const userId = body.user.id;
+  try {
+    await serializedPerUser(userId, () => recordFeedback(userId, 'up'));
+    await respond({ text: 'Thanks for the feedback! 👍', response_type: 'ephemeral', replace_original: false });
+  } catch (err) {
+    logError(`feedback_up handler failed for user ${userId}:`, err);
+  }
+});
+
+app.action('feedback_down', async ({ ack, body, respond }) => {
+  await ack();
+  const userId = body.user.id;
+  try {
+    await serializedPerUser(userId, () => recordFeedback(userId, 'down'));
+    await respond({
+      text: "Thanks for the feedback — noted. 👎",
+      response_type: 'ephemeral',
+      replace_original: false,
+    });
+  } catch (err) {
+    logError(`feedback_down handler failed for user ${userId}:`, err);
+  }
+});
+
 // ── Role button handlers ──────────────────────────────────
-// Keys here must be the same canonical roles used by roleSearchTerms /
-// notionSearchTerms / ROLE_LABELS ('engineer' / 'pm' / 'designer' /
-// 'other'). This used to hardcode a separate, drifted set of strings
-// ('product manager', 'design', 'general onboarding') that matched
-// nothing else in the file — roleButtons above already carries the
-// correct keys as each button's `value`, but that value was never read.
-// The mismatch had two consequences: role/roleLabel written to the
-// context store from a button click didn't match what extractStatedRole
-// or detectRoleFromText would ever produce for the same role, and
-// roleSearchTerms[role] / notionSearchTerms[role] silently missed for
-// PM, Designer, and Other, falling back to the generic 'other' search
-// terms for every role except Engineer. Deriving roleLabel from
-// ROLE_LABELS instead of a second hardcoded string removes the
-// possibility of this drifting again.
-const roleMap = {
-  role_engineer: 'engineer',
-  role_pm: 'pm',
-  role_designer: 'designer',
-  role_other: 'other',
-};
+// Derived from roles.js, same as everything else role-related — this
+// used to be a separately hardcoded object with its own drifted set of
+// keys ('product manager', 'design', 'general onboarding') that matched
+// nothing else in the file. Deriving it here instead of hand-listing
+// action IDs also means a new role added to roles.js automatically gets
+// a working button handler with no further changes needed.
+const roleMap = Object.fromEntries(ROLES.map((r) => [`role_${r.id}`, r.id]));
 
 Object.entries(roleMap).forEach(([actionId, role]) => {
   app.action(actionId, async ({ body, client, ack }) => {
@@ -702,7 +804,7 @@ Object.entries(roleMap).forEach(([actionId, role]) => {
           text: 'Sorry, something went wrong handling that — please try again.',
         });
       } catch (notifyErr) {
-        console.error(`Also failed to notify user ${userId} after a role button error:`, notifyErr);
+        logError(`Also failed to notify user ${userId} after a role button error:`, notifyErr);
       }
     }
   });

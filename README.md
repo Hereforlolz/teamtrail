@@ -51,7 +51,7 @@ Follow-up question typed in the pane  →  same combined search  →  Groq answe
 ## Features
 
 - **Native Slack AI app surface** — lives in the top bar with a dedicated split-pane container (Slack's Agents & AI Apps feature), not a slash command
-- **Role-aware onboarding** — Engineer, PM, Designer, or Other, each mapped to different RTS search terms for better recall
+- **Role-aware onboarding** — Engineer, PM, Designer, or Other, each mapped to different RTS search terms for better recall. Roles are configurable — add one by editing `roles.js`, nothing else needs to change (buttons, search terms, keyword matching, and the button-click handlers are all derived from that one file)
 - **Two ways to pick a role** — explicit buttons in the thread, or fixed suggested prompts ("I'm a new Engineer, brief me") that route through the same handler
 - **Real-time workspace search** via `assistant.search.context` (Slack's RTS API) — searches actual messages, users, and channels, not a static knowledge base
 - **Semantic query rewriting** — bare keyword queries like `rate limiting` are rewritten to `What is the latest on rate limiting?` to trigger RTS semantic mode; OR-operator queries are left as-is for keyword recall
@@ -64,6 +64,8 @@ Follow-up question typed in the pane  →  same combined search  →  Groq answe
 - **Graceful sparse-workspace handling** — if RTS returns no users or channels (expected in sandboxes with limited history), the LLM is prompted to say so honestly rather than hallucinate people or channel names
 - **File search** — RTS also searches `files`, not just `messages`, surfacing PRDs and architecture docs shared in Slack
 - **Notion MCP integration** — optionally pulls relevant Notion pages into the same briefing/answer pipeline via a locally-run Notion MCP server, merged into one prompt alongside Slack messages and files
+- **👍/👎 feedback buttons** on every briefing and follow-up answer — real signal on answer quality, aggregated per user and rolled up in `/teamtrail-status`
+- **`/teamtrail-status` admin command** — usage stats (users onboarded, role breakdown, questions asked, feedback totals) plus uptime since the last restart, in one reply. Admin-only (see `ADMIN_USER_IDS` below) since aggregate usage data about other users shouldn't be visible to everyone poking at the demo
 
 ---
 
@@ -214,6 +216,7 @@ Notion sources are merged into the same `sources` array as Slack messages/files,
 ```
 ├── index.js            # Main bot — Assistant lifecycle, RTS calls, Groq prompts
 ├── lib.js              # Pure logic pulled out of index.js — no Slack/Groq/fs dependency, unit tested
+├── roles.js            # Role configuration — add a role here, nothing else needs to change
 ├── notion.js           # Notion MCP client — connects to a locally-run Notion MCP server
 ├── store.js            # Persistent per-user context store (JSON file on disk)
 ├── start.sh            # Runs the bot + local Notion MCP server together, restarts on crash
@@ -294,6 +297,13 @@ Anyone can already ask for onboarding by typing "onboard me" (or "restart onboar
 4. Reinstall the app (same as step 4 above) for the new scope to take effect
 
 Neither trigger resets an already-onboarded user's state — an employee is onboarded once, then TeamTrail keeps acting as their ongoing internal assistant. For someone already onboarded, both just reply to say so and point to the **Refresh** button instead of wiping anything.
+
+### Optional: `/teamtrail-status` slash command
+
+Admin-only usage stats and a basic liveness signal (see `ADMIN_USER_IDS` below — this command replies with a permission message to anyone not on that list). Set up the same way as `/onboard`:
+
+1. **Slash Commands** → **Create New Command** → `/teamtrail-status`, e.g. "TeamTrail usage stats and uptime"
+2. Add the `commands` scope if you haven't already (shared with `/onboard` — only need to add it once) and reinstall
 
 ### 5. Clone and install
 
@@ -395,6 +405,7 @@ This runs `start.sh`, which starts the Notion MCP server first if `NOTION_TOKEN`
 | `NOTION_ALLOW_UNSAFE_AUTH` | Optional. Explicit override required to run `start.sh`'s `--unsafe-disable-auth` Notion server launch under `NODE_ENV=production` |
 | `RATE_LIMIT_MAX` | Optional — defaults to `10`. Max Groq/RTS/Notion-triggering requests a single user can make within `RATE_LIMIT_WINDOW_MS` |
 | `RATE_LIMIT_WINDOW_MS` | Optional — defaults to `300000` (5 minutes). Sliding window for the per-user rate limit above |
+| `ADMIN_USER_IDS` | Optional. Comma-separated Slack user IDs (e.g. `U01ABCDEF,U02GHIJKL`) allowed to run `/teamtrail-status`. Unset means nobody can — the command replies with a permission message instead of exposing usage data to any workspace member |
 
 ---
 
@@ -404,7 +415,7 @@ This runs `start.sh`, which starts the Notion MCP server first if `NOTION_TOKEN`
 npm test
 ```
 
-Runs `test_unit.js` against `lib.js` — the pure, dependency-free logic (role/onboarding-phrase matching, result formatting, citation labeling, rate limiting) pulled out of `index.js` specifically so it's unit-testable without constructing a real `@slack/bolt` App. Most of these cases are regressions of actual bugs found during manual testing (role-key drift, the follow-up-question hijack, the "product owner" gap, citation-label drift), not generic filler coverage.
+Runs `test_unit.js` against `lib.js` — the pure, dependency-free logic (role/onboarding-phrase matching, result formatting, citation labeling, rate limiting, usage-stats aggregation) pulled out of `index.js` specifically so it's unit-testable without constructing a real `@slack/bolt` App. Most of these cases are regressions of actual bugs found during manual testing (role-key drift, the follow-up-question hijack, the "product owner" gap, citation-label drift), not generic filler coverage.
 
 `test_rts.sh` and `test_notion_mcp.js` remain separate, live-credential smoke tests against the real Slack/Notion APIs — see their sections above.
 
@@ -420,6 +431,7 @@ Runs `test_unit.js` against `lib.js` — the pure, dependency-free logic (role/o
 - **Notion page content is fetched for only the top search result** per query (`fetchContentForTop = 1` in `notion.js`), to keep prompt size and latency reasonable. Other matching pages are cited by title/URL only, without their content summarized.
 - **The prompt-injection guard is a mitigation, not a guarantee.** Both prompts tell Groq to treat retrieved Slack/Notion content as reference material only, never as instructions, and to stay on topic — but Llama 3.3 has no Anthropic-style safety tuning of its own, so a sufficiently crafted message could still partially work around this. A fully deterministic fix would mean not passing untrusted content into the same context window as instructions at all, which isn't practical for a RAG-style app like this one.
 - **Rate limiting is a cost guardrail, not a security control.** `isRateLimited` (in `lib.js`) is an in-memory sliding window per Slack user ID, reset on every process restart. It stops accidental bursts (double-clicks, enthusiastic rapid testing) from running up Groq/RTS spend; it would not meaningfully slow down someone deliberately trying to abuse the bot, since restarting the process (or, for now, any request pattern spread across a restart) clears it.
+- **Feedback (👍/👎) is tracked as a per-user aggregate, not per-answer.** Clicking 👎 on a specific briefing or follow-up increments that user's overall down-count in `/teamtrail-status` — there's no record of which specific answer prompted it. Good enough to see a rough up/down ratio; not enough to go find "the bad answers."
 - **Slack's own MCP Server toggle is unused** — Agents & AI Apps settings expose an optional Slack MCP Server (search/post/read via MCP tools instead of direct RTS calls). This build keeps the existing direct RTS calls instead of re-platforming onto it, since it would replace already-working code with an equivalent capability rather than add a new one.
 - **The "don't invent a source" instruction is a prompt-level mitigation, not a hard guarantee** — the prompts now explicitly tell Groq to only name/link a document if it's in the numbered results, which should sharply reduce (not provably eliminate) it confidently citing something like a "Handbook" in one reply and saying it can't find a link for the same thing later. A fully deterministic fix would mean validating every citation the model outputs against the actual `sources` array before sending the reply, which this doesn't do.
 
