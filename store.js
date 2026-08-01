@@ -80,6 +80,7 @@ function getContext(userId) {
       questionsAsked: [],
       briefingSent: false,
       welcomed: false,
+      feedback: { up: 0, down: 0 },
     };
   }
   return contextStore[userId];
@@ -90,4 +91,15 @@ function updateContext(userId, updates) {
   persistStore();
 }
 
-module.exports = { getContext, updateContext };
+// For the /teamtrail-status admin command — a snapshot of every user's
+// context, to compute aggregate stats from (see computeStats in lib.js).
+// Deep-cloned via JSON round-trip (every context is already guaranteed
+// JSON-serializable, since it's persisted to disk as JSON) rather than a
+// shallow copy — a shallow `{ ...contextStore }` still leaves each
+// per-user object as the same reference as the live store, so mutating
+// a returned entry's fields would silently mutate real state.
+function getAllContexts() {
+  return JSON.parse(JSON.stringify(contextStore));
+}
+
+module.exports = { getContext, updateContext, getAllContexts };

@@ -21,6 +21,8 @@ const {
   detectRoleFromText,
   extractStatedRole,
   isOnboardRequest,
+  computeStats,
+  isAdmin,
 } = require('./lib');
 
 test('matchRoleKeyword recognizes role synonyms, including "product owner"', () => {
@@ -168,4 +170,33 @@ test('isRateLimited tracks distinct users independently', () => {
   for (let i = 0; i < max; i++) isRateLimited(userA);
   assert.equal(isRateLimited(userA), true, 'userA should now be rate limited');
   assert.equal(isRateLimited(userB), false, 'userB should be unaffected by userA\'s usage');
+});
+
+test('computeStats aggregates onboarded users, role breakdown, questions, and feedback', () => {
+  const contexts = {
+    U1: { briefingSent: true, roleLabel: 'Engineer', questionsAsked: ['a', 'b'], feedback: { up: 2, down: 0 } },
+    U2: { briefingSent: true, roleLabel: 'Product Manager', questionsAsked: ['a'], feedback: { up: 0, down: 1 } },
+    U3: { briefingSent: false, questionsAsked: ['a', 'b', 'c'] }, // never onboarded, no feedback field at all
+  };
+  const stats = computeStats(contexts);
+  assert.equal(stats.totalUsers, 3);
+  assert.equal(stats.totalOnboarded, 2);
+  assert.deepEqual(stats.roleBreakdown, { Engineer: 1, 'Product Manager': 1 });
+  assert.equal(stats.totalQuestions, 6);
+  assert.equal(stats.feedbackUp, 2);
+  assert.equal(stats.feedbackDown, 1);
+});
+
+test('computeStats handles an empty store without throwing', () => {
+  const stats = computeStats({});
+  assert.equal(stats.totalUsers, 0);
+  assert.equal(stats.totalOnboarded, 0);
+  assert.deepEqual(stats.roleBreakdown, {});
+  assert.equal(stats.totalQuestions, 0);
+});
+
+test('isAdmin checks membership in the provided allowlist only', () => {
+  assert.equal(isAdmin('U1', ['U1', 'U2']), true);
+  assert.equal(isAdmin('U9', ['U1', 'U2']), false);
+  assert.equal(isAdmin('U1', []), false);
 });
