@@ -60,6 +60,7 @@ Follow-up question typed in the pane  →  same combined search  →  Groq answe
 - **Stateful per-user context** — tracks role, topics covered, and questions asked across the session; the LLM is explicitly told not to repeat topics already covered
 - **Follow-up questions in-thread** — just type in the assistant pane; same RTS + Groq pipeline that used to live behind `/ask`, with session context carried over
 - **Refresh briefing** button — clears state and restarts the onboarding flow
+- **Manual onboarding trigger** — type "onboard me" in the assistant pane, or use the optional `/onboard` slash command from anywhere, to start onboarding without needing a fresh channel-join event — covers someone who missed or dismissed their original welcome message. Deliberately not a reset: an employee is onboarded once, then TeamTrail keeps working as an ongoing internal assistant — for someone already onboarded, this just replies to say so instead of wiping their history. **🔄 Refresh my briefing** remains the one explicit, deliberate way to actually start over
 - **Graceful sparse-workspace handling** — if RTS returns no users or channels (expected in sandboxes with limited history), the LLM is prompted to say so honestly rather than hallucinate people or channel names
 - **File search** — RTS also searches `files`, not just `messages`, surfacing PRDs and architecture docs shared in Slack
 - **Notion MCP integration** — optionally pulls relevant Notion pages into the same briefing/answer pipeline via a locally-run Notion MCP server, merged into one prompt alongside Slack messages and files
@@ -213,9 +214,13 @@ Notion sources are merged into the same `sources` array as Slack messages/files,
 ```
 ├── index.js            # Main bot — Assistant lifecycle, RTS calls, Groq prompts
 ├── notion.js           # Notion MCP client — connects to a locally-run Notion MCP server
+├── store.js            # Persistent per-user context store (JSON file on disk)
+├── start.sh            # Runs the bot + local Notion MCP server together, restarts on crash
 ├── test_rts.sh         # Standalone RTS smoke tester (run before deploying)
 ├── test_notion_mcp.js  # Standalone Notion MCP smoke tester — confirms real tool names/shapes
 ├── .env                # Secrets (not committed)
+├── .env.example        # Template for .env — copy and fill in
+├── data/               # Persisted context store (git-ignored, created on first run)
 ├── package.json
 └── README.md
 ```
@@ -277,6 +282,17 @@ member_joined_channel
 
 If you'd already installed the app before enabling Agents & AI Apps, you must **reinstall** for the new `assistant:write` scope to take effect. Confirm it appears in the scope list before clicking Allow.
 
+### Optional: `/onboard` slash command
+
+Anyone can already ask for onboarding by typing "onboard me" (or "restart onboarding", etc.) directly in the assistant pane — that needs no setup and works today. A `/onboard` slash command is also built in as a more discoverable alternative: it works from anywhere (a DM or a channel), not just from inside the assistant pane, which matters for someone who missed their onboarding message entirely and doesn't know the pane exists. It's inert until you activate it:
+
+1. In the left sidebar, go to **Slash Commands** → **Create New Command**
+2. Command: `/onboard`, short description: e.g. "Get onboarded with TeamTrail" — no Request URL needed, since this app uses Socket Mode
+3. Save, then add the `commands` scope under **OAuth & Permissions** (Bot Token Scopes) if it isn't already there
+4. Reinstall the app (same as step 4 above) for the new scope to take effect
+
+Neither trigger resets an already-onboarded user's state — an employee is onboarded once, then TeamTrail keeps acting as their ongoing internal assistant. For someone already onboarded, both just reply to say so and point to the **Refresh** button instead of wiping anything.
+
 ### 5. Clone and install
 
 ```bash
@@ -326,6 +342,8 @@ If the Notion MCP server isn't running, the bot still works — `notionSearch()`
 
 ### 9. Start the bot
 
+The bot checks `SLACK_BOT_TOKEN`, `SLACK_USER_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_APP_TOKEN`, and `GROQ_API_KEY` at startup and refuses to start with a clear message if any are missing — see `.env.example`.
+
 ```bash
 node index.js
 ```
@@ -335,6 +353,14 @@ You should see:
 ⚡ TeamTrail is running!
 ```
 
+To also start the local Notion MCP server automatically (instead of running it in a separate terminal per step 8) and have the bot restart itself if it crashes:
+
+```bash
+npm run start:all
+```
+
+This runs `start.sh`, which starts the Notion MCP server first if `NOTION_TOKEN` is set (skipped otherwise — the bot still runs fine Slack-only), then starts the bot in a restart loop. If you're deploying this behind a process supervisor (systemd, Docker, pm2), point it at `start.sh` rather than `node index.js` directly, so the Notion server stays paired with the bot across restarts.
+
 ---
 
 ## Usage
@@ -343,7 +369,7 @@ You should see:
 2. Pick a role — click a button, or use one of the suggested prompts
 3. A personalised briefing posts in the same pane within a few seconds, with cited sources
 4. Type any follow-up question directly in the pane — the bot remembers what's already been covered and won't repeat itself
-5. Click **🔄 Refresh my briefing** at any time to restart
+5. Click **🔄 Refresh my briefing** at any time for a fresh briefing. Missed onboarding entirely? Type "onboard me" in the pane, or use `/onboard` from anywhere if the slash command is set up (see Setup) — for someone already onboarded, these just confirm that and point to Refresh, rather than resetting anything
 
 ---
 
@@ -359,18 +385,25 @@ You should see:
 | `NOTION_TOKEN` | Internal integration token (`ntn_...`) — set in the terminal running the Notion MCP server, not the bot's own `.env`, since the server reads it directly |
 | `NOTION_MCP_URL` | Optional — defaults to `http://127.0.0.1:3331/mcp`. Override if running the Notion MCP server on a different port |
 | `NOTION_TIMEOUT_MS` | Optional — defaults to `8000`. Max time to wait on the Notion MCP server before falling back to Slack-only content, so a hung (not just down) server can't stall a briefing |
+| `CONTEXT_STORE_PATH` | Optional — defaults to `./data/context-store.json`. Where per-user context is persisted on disk |
+| `CONTEXT_STORE_MAX_AGE_DAYS` | Optional — defaults to `90`. Entries older than this are dropped on startup so the store doesn't grow forever |
+| `NOTION_MCP_PORT` | Optional — defaults to `3331`. Used by `start.sh` to launch the Notion MCP server and to poll its `/health` endpoint before starting the bot |
+| `NOTION_READY_TIMEOUT_SECS` | Optional — defaults to `30`. How long `start.sh` waits for the Notion MCP server to report healthy before giving up |
+| `NODE_ENV` | Optional — defaults to `development`. Set to `production` and `start.sh` refuses to launch the Notion MCP server with `--unsafe-disable-auth` unless `NOTION_ALLOW_UNSAFE_AUTH=true` is also set |
+| `NOTION_ALLOW_UNSAFE_AUTH` | Optional. Explicit override required to run `start.sh`'s `--unsafe-disable-auth` Notion server launch under `NODE_ENV=production` |
 
 ---
 
 ## Known limitations
 
-- **State is in-memory** — context resets on process restart. A Redis or SQLite layer would make it persistent across deployments. Per Slack's guidance for Agents & AI Apps, only metadata (role, topics, question text) is stored — never raw Slack message content.
+- **State persists to a local JSON file (`store.js`), not a database** — survives process restarts (an upgrade from the earlier fully in-memory version), but doesn't survive the disk itself disappearing, and isn't safe for multiple bot instances writing concurrently. Fine for a single always-running process; would need a real database if this ever ran as more than one instance. Per Slack's guidance for Agents & AI Apps, only metadata (role, topics, question text) is stored — never raw Slack message content.
 - **User/channel discovery** returns empty in sparse workspaces — this is an RTS API behaviour, not a bug. The LLM prompt handles it honestly.
 - **Single workspace** — the user token is workspace-scoped. Multi-workspace support would require per-installation token storage.
 - **Notion MCP uses the local server, not the hosted one** — Notion's remote MCP requires interactive OAuth per session, which doesn't work for a headless bot. The local server with a static integration token is the only option that fits this architecture.
-- **Notion MCP requires `--unsafe-disable-auth` for this setup** — the server's own auto-generated bearer token (separate from `NOTION_TOKEN`) rotates every restart and isn't read by `notion.js`. Disabling it is safe here since the server only listens on `127.0.0.1`, but would need real handling before any deployment beyond local development.
+- **Notion MCP requires `--unsafe-disable-auth` for this setup** — the server's own auto-generated bearer token (separate from `NOTION_TOKEN`) rotates every restart and isn't read by `notion.js`. Disabling it is safe here since the server only listens on `127.0.0.1`. `start.sh` refuses to launch it this way under `NODE_ENV=production` unless `NOTION_ALLOW_UNSAFE_AUTH=true` is explicitly set, so this can't silently ship enabled in a deployed environment.
 - **Notion page content is fetched for only the top search result** per query (`fetchContentForTop = 1` in `notion.js`), to keep prompt size and latency reasonable. Other matching pages are cited by title/URL only, without their content summarized.
 - **Slack's own MCP Server toggle is unused** — Agents & AI Apps settings expose an optional Slack MCP Server (search/post/read via MCP tools instead of direct RTS calls). This build keeps the existing direct RTS calls instead of re-platforming onto it, since it would replace already-working code with an equivalent capability rather than add a new one.
+- **The "don't invent a source" instruction is a prompt-level mitigation, not a hard guarantee** — the prompts now explicitly tell Groq to only name/link a document if it's in the numbered results, which should sharply reduce (not provably eliminate) it confidently citing something like a "Handbook" in one reply and saying it can't find a link for the same thing later. A fully deterministic fix would mean validating every citation the model outputs against the actual `sources` array before sending the reply, which this doesn't do.
 
 ## Known gotchas (Bolt for JS, `@slack/bolt@4.7.3`)
 
