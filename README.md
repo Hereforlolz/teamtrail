@@ -213,9 +213,11 @@ Notion sources are merged into the same `sources` array as Slack messages/files,
 
 ```
 ├── index.js            # Main bot — Assistant lifecycle, RTS calls, Groq prompts
+├── lib.js              # Pure logic pulled out of index.js — no Slack/Groq/fs dependency, unit tested
 ├── notion.js           # Notion MCP client — connects to a locally-run Notion MCP server
 ├── store.js            # Persistent per-user context store (JSON file on disk)
 ├── start.sh            # Runs the bot + local Notion MCP server together, restarts on crash
+├── test_unit.js        # Unit tests for lib.js (`npm test`) — run with node --test
 ├── test_rts.sh         # Standalone RTS smoke tester (run before deploying)
 ├── test_notion_mcp.js  # Standalone Notion MCP smoke tester — confirms real tool names/shapes
 ├── .env                # Secrets (not committed)
@@ -391,6 +393,20 @@ This runs `start.sh`, which starts the Notion MCP server first if `NOTION_TOKEN`
 | `NOTION_READY_TIMEOUT_SECS` | Optional — defaults to `30`. How long `start.sh` waits for the Notion MCP server to report healthy before giving up |
 | `NODE_ENV` | Optional — defaults to `development`. Set to `production` and `start.sh` refuses to launch the Notion MCP server with `--unsafe-disable-auth` unless `NOTION_ALLOW_UNSAFE_AUTH=true` is also set |
 | `NOTION_ALLOW_UNSAFE_AUTH` | Optional. Explicit override required to run `start.sh`'s `--unsafe-disable-auth` Notion server launch under `NODE_ENV=production` |
+| `RATE_LIMIT_MAX` | Optional — defaults to `10`. Max Groq/RTS/Notion-triggering requests a single user can make within `RATE_LIMIT_WINDOW_MS` |
+| `RATE_LIMIT_WINDOW_MS` | Optional — defaults to `300000` (5 minutes). Sliding window for the per-user rate limit above |
+
+---
+
+## Testing
+
+```bash
+npm test
+```
+
+Runs `test_unit.js` against `lib.js` — the pure, dependency-free logic (role/onboarding-phrase matching, result formatting, citation labeling, rate limiting) pulled out of `index.js` specifically so it's unit-testable without constructing a real `@slack/bolt` App. Most of these cases are regressions of actual bugs found during manual testing (role-key drift, the follow-up-question hijack, the "product owner" gap, citation-label drift), not generic filler coverage.
+
+`test_rts.sh` and `test_notion_mcp.js` remain separate, live-credential smoke tests against the real Slack/Notion APIs — see their sections above.
 
 ---
 
@@ -402,6 +418,8 @@ This runs `start.sh`, which starts the Notion MCP server first if `NOTION_TOKEN`
 - **Notion MCP uses the local server, not the hosted one** — Notion's remote MCP requires interactive OAuth per session, which doesn't work for a headless bot. The local server with a static integration token is the only option that fits this architecture.
 - **Notion MCP requires `--unsafe-disable-auth` for this setup** — the server's own auto-generated bearer token (separate from `NOTION_TOKEN`) rotates every restart and isn't read by `notion.js`. Disabling it is safe here since the server only listens on `127.0.0.1`. `start.sh` refuses to launch it this way under `NODE_ENV=production` unless `NOTION_ALLOW_UNSAFE_AUTH=true` is explicitly set, so this can't silently ship enabled in a deployed environment.
 - **Notion page content is fetched for only the top search result** per query (`fetchContentForTop = 1` in `notion.js`), to keep prompt size and latency reasonable. Other matching pages are cited by title/URL only, without their content summarized.
+- **The prompt-injection guard is a mitigation, not a guarantee.** Both prompts tell Groq to treat retrieved Slack/Notion content as reference material only, never as instructions, and to stay on topic — but Llama 3.3 has no Anthropic-style safety tuning of its own, so a sufficiently crafted message could still partially work around this. A fully deterministic fix would mean not passing untrusted content into the same context window as instructions at all, which isn't practical for a RAG-style app like this one.
+- **Rate limiting is a cost guardrail, not a security control.** `isRateLimited` (in `lib.js`) is an in-memory sliding window per Slack user ID, reset on every process restart. It stops accidental bursts (double-clicks, enthusiastic rapid testing) from running up Groq/RTS spend; it would not meaningfully slow down someone deliberately trying to abuse the bot, since restarting the process (or, for now, any request pattern spread across a restart) clears it.
 - **Slack's own MCP Server toggle is unused** — Agents & AI Apps settings expose an optional Slack MCP Server (search/post/read via MCP tools instead of direct RTS calls). This build keeps the existing direct RTS calls instead of re-platforming onto it, since it would replace already-working code with an equivalent capability rather than add a new one.
 - **The "don't invent a source" instruction is a prompt-level mitigation, not a hard guarantee** — the prompts now explicitly tell Groq to only name/link a document if it's in the numbered results, which should sharply reduce (not provably eliminate) it confidently citing something like a "Handbook" in one reply and saying it can't find a link for the same thing later. A fully deterministic fix would mean validating every citation the model outputs against the actual `sources` array before sending the reply, which this doesn't do.
 
