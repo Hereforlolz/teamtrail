@@ -12,6 +12,7 @@ const {
   formatFileResults,
   formatCombinedResults,
   formatSourcesBlock,
+  validateCitations,
   matchRoleKeyword,
   titleCase,
   detectRoleFromText,
@@ -427,7 +428,9 @@ Answer concisely. Reference result numbers like [1] or [N1] when you draw on a s
       await setStatus('Writing your answer...');
 
       try {
-        const answer = await askGroq(prompt, 512);
+        const rawAnswer = await askGroq(prompt, 512);
+        const { text: answer, removed } = validateCitations(rawAnswer, sources);
+        if (removed.length) console.warn(`Stripped unverifiable citations from answer: ${removed.join(', ')}`);
 
         ctx.topicsCovered.push(question.slice(0, 50));
         updateContext(userId, { topicsCovered: ctx.topicsCovered });
@@ -636,7 +639,9 @@ Keep it warm, concise, and actionable. Use Slack markdown (bold with *asterisks*
 
     if (setStatus) await setStatus('Writing your briefing...');
 
-    const briefing = await askGroq(prompt);
+    const rawBriefing = await askGroq(prompt);
+    const { text: briefing, removed } = validateCitations(rawBriefing, sources);
+    if (removed.length) console.warn(`Stripped unverifiable citations from briefing: ${removed.join(', ')}`);
 
     // Append, don't replace — this can run for a user who already asked
     // follow-up questions (and accumulated topicsCovered) before ever
