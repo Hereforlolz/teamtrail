@@ -16,6 +16,7 @@ const {
   formatFileResults,
   formatCombinedResults,
   formatSourcesBlock,
+  validateCitations,
   matchRoleKeyword,
   titleCase,
   detectRoleFromText,
@@ -199,4 +200,40 @@ test('isAdmin checks membership in the provided allowlist only', () => {
   assert.equal(isAdmin('U1', ['U1', 'U2']), true);
   assert.equal(isAdmin('U9', ['U1', 'U2']), false);
   assert.equal(isAdmin('U1', []), false);
+});
+
+// Regression for the "cites a Handbook in one reply, can't find it in the
+// next" hallucination: the prompt asks the model not to invent sources,
+// this verifies the answer against the real sources array.
+test('validateCitations keeps real citations and links untouched', () => {
+  const sources = [
+    { channel: 'eng', permalink: 'https://slack.test/p1', label: '1' },
+    { channel: 'notion', permalink: 'https://notion.so/page', label: 'N1' },
+  ];
+  const answer = 'Deploys are weekly [1], see <https://notion.so/page|the runbook> [N1].';
+  const { text, removed } = validateCitations(answer, sources);
+  assert.equal(text, answer);
+  assert.deepEqual(removed, []);
+});
+
+test('validateCitations strips citation markers that match no source', () => {
+  const sources = [{ channel: 'eng', permalink: 'https://slack.test/p1', label: '1' }];
+  const { text, removed } = validateCitations('Per the handbook [7] and [N3], also [1].', sources);
+  assert.equal(text, 'Per the handbook and, also [1].');
+  assert.deepEqual(removed, ['[7]', '[N3]']);
+});
+
+test('validateCitations removes invented links but keeps Slack link display text', () => {
+  const sources = [{ channel: 'eng', permalink: 'https://slack.test/p1', label: '1' }];
+  const { text, removed } = validateCitations(
+    'Read <https://fake.example/handbook|the Handbook> or https://fake.example/x now.',
+    sources
+  );
+  assert.equal(text, 'Read the Handbook or now.');
+  assert.deepEqual(removed, ['https://fake.example/handbook', 'https://fake.example/x']);
+});
+
+test('validateCitations handles empty answer and no sources', () => {
+  assert.deepEqual(validateCitations('', []), { text: '', removed: [] });
+  assert.equal(validateCitations('see [1]', []).text, 'see');
 });

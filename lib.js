@@ -130,6 +130,39 @@ function formatCombinedResults(messages = [], files = []) {
   };
 }
 
+// Deterministic backstop for the prompt-level "don't invent a source"
+// instruction: checks the model's answer against the real `sources`
+// array instead of trusting it. Two things are removed —
+//  1. inline citation markers ([3], [N2]) whose label isn't a real source
+//  2. links (Slack <url|text> or bare http(s) URLs) not matching any real
+//     source permalink; a Slack-style link keeps its display text.
+// Returns { text, removed } so callers can log what was stripped.
+function validateCitations(answer, sources = []) {
+  const labels = new Set(sources.map((s) => String(s.label)));
+  const urls = new Set(sources.map((s) => s.permalink).filter(Boolean));
+  const removed = [];
+
+  let text = String(answer || '').replace(/\s?\[(N?\d+)\]/g, (match, label) => {
+    if (labels.has(label)) return match;
+    removed.push(`[${label}]`);
+    return '';
+  });
+
+  text = text.replace(/<(https?:\/\/[^|>\s]+)(?:\|([^>]*))?>/g, (match, url, display) => {
+    if (urls.has(url)) return match;
+    removed.push(url);
+    return display || '';
+  });
+
+  text = text.replace(/(^|[\s(])(https?:\/\/[^\s<>)]+)[ \t]?/g, (match, lead, url) => {
+    if (urls.has(url)) return match;
+    removed.push(url);
+    return lead;
+  });
+
+  return { text, removed };
+}
+
 function formatSourcesBlock(sources) {
   if (!sources.length) return null;
 
@@ -281,6 +314,7 @@ module.exports = {
   formatFileResults,
   formatCombinedResults,
   formatSourcesBlock,
+  validateCitations,
   matchRoleKeyword,
   titleCase,
   detectRoleFromText,
